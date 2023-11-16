@@ -46,7 +46,7 @@ use crate::upgrade_checks::VersionCheckInfo;
 
 mod clone;
 mod dematerialize;
-mod dir_summary;
+pub mod dir_summary;
 mod filter;
 pub mod init;
 mod install;

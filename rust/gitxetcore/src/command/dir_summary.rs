@@ -17,17 +17,17 @@ const DIR_SUMMARY_VERSION: i64 = 1;
 pub struct DirSummaryArgs {
     /// A git commit reference to build directory summary statistics
     #[clap(default_value = "HEAD")]
-    reference: String,
+    pub reference: String,
 
     /// If set, do not read nor write the summary statistics in git notes
     #[clap(long)]
-    no_cache: bool,
+    pub no_cache: bool,
 
     /// If true, aggregate results so that each directory contains the results of all
     /// subdirectories as well.  Otherwise, the summary for a directory ignores
     /// subdirectories.  
     #[clap(long)]
-    recursive: bool,
+    pub recursive: bool,
 }
 
 pub async fn dir_summary_command(config: XetConfig, args: &DirSummaryArgs) -> errors::Result<()> {
