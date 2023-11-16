@@ -31,6 +31,12 @@ pub struct DirSummaryArgs {
 }
 
 pub async fn dir_summary_command(config: XetConfig, args: &DirSummaryArgs) -> errors::Result<()> {
+    let result = dir_summary_command_impl(config, args).await?;
+    println!("{result}");
+    Ok(())
+}
+
+pub async fn dir_summary_command_impl(config: XetConfig, args: &DirSummaryArgs) -> errors::Result<String> {
     let repo = GitXetRepo::open(config.clone())?;
     let gitrepo = &repo.repo;
 
@@ -82,8 +88,7 @@ pub async fn dir_summary_command(config: XetConfig, args: &DirSummaryArgs) -> er
         }
     }
 
-    println!("{content_str}");
-    Ok(())
+    Ok(content_str)
 }
 
 type FileExtension = String;
