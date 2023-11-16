@@ -31,12 +31,12 @@ pub struct DirSummaryArgs {
 }
 
 pub async fn dir_summary_command(config: XetConfig, args: &DirSummaryArgs) -> errors::Result<()> {
-    let result = dir_summary_command_impl(config, args).await?;
+    let result = dir_summary_command_impl(config, args)?;
     println!("{result}");
     Ok(())
 }
 
-pub async fn dir_summary_command_impl(config: XetConfig, args: &DirSummaryArgs) -> errors::Result<String> {
+pub fn dir_summary_command_impl(config: XetConfig, args: &DirSummaryArgs) -> errors::Result<String> {
     let repo = GitXetRepo::open(config.clone())?;
     let gitrepo = &repo.repo;
 
@@ -75,7 +75,7 @@ pub async fn dir_summary_command_impl(config: XetConfig, args: &DirSummaryArgs) 
     if recompute {
         tracing::info!("Recomputing");
         // recompute the dir summary
-        let summaries = compute_dir_summaries(&repo, &args.reference, args.recursive).await?;
+        let summaries = compute_dir_summaries(&repo, &args.reference, args.recursive)?;
 
         content_str = serde_json::to_string_pretty(&summaries).map_err(|_| {
             GitXetRepoError::Other("Failed to serialize dir summaries to JSON".to_string())
@@ -122,7 +122,7 @@ fn compute_file_summary(path: &str) -> errors::Result<FileSummary> {
     Ok(ret)
 }
 
-pub async fn compute_dir_summaries(
+pub fn compute_dir_summaries(
     repo: &GitXetRepo,
     reference: &str,
     recursive: bool,
