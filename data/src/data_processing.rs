@@ -21,7 +21,6 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::error;
-use url::Url;
 
 #[derive(Default, Debug)]
 pub struct CASDataAggregator {
@@ -330,9 +329,7 @@ impl PointerFileTranslator {
             Endpoint::FileSystem(_) => panic!("aaaaaaaa no server"),
         };
 
-        let url = Url::parse(&endpoint).unwrap();
-
-        let rc = CASAPIClient::new(url.scheme(), url.domain().unwrap());
+        let rc = CASAPIClient::new(&endpoint);
 
         rc.write_file(file_id, writer).await?;
 

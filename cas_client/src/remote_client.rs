@@ -1,4 +1,4 @@
-use std::io::{BufWriter, Cursor, Write};
+use std::io::{Cursor, Write};
 
 use anyhow::anyhow;
 use bytes::Buf;
@@ -20,14 +20,11 @@ use merklehash::MerkleHash;
 use tracing::debug;
 
 use crate::Client;
-
-pub const CAS_ENDPOINT: &str = "localhost:8080";
-pub const SCHEME: &str = "http:/";
+pub const CAS_ENDPOINT: &str = "http://localhost:8080";
 pub const PREFIX_DEFAULT: &str = "default";
 
 #[derive(Debug)]
 pub struct RemoteClient {
-    endpoint: String,
     client: CASAPIClient,
 }
 
@@ -88,34 +85,32 @@ impl Client for RemoteClient {
 
 impl RemoteClient {
     pub async fn from_config(endpoint: String) -> Self {
-        Self { endpoint, client: CASAPIClient::default() }
+        Self { client: CASAPIClient::new(&endpoint) }
     }
 }
 
 #[derive(Debug)]
 pub struct CASAPIClient {
     client: reqwest::Client,
-    scheme: String,
     endpoint: String,
 }
 
 impl Default for CASAPIClient {
     fn default() -> Self {
-        Self::new(SCHEME, CAS_ENDPOINT)
+        Self::new(CAS_ENDPOINT)
     }
 }
 
 impl CASAPIClient {
-    pub fn new(scheme: &str, endpoint: &str) -> Self {
+    pub fn new(endpoint: &str) -> Self {
         let client = reqwest::Client::builder()
-            .http2_prior_knowledge()
             .build()
             .unwrap();
-        Self { client, scheme: scheme.to_string(), endpoint: endpoint.to_string() }
+        Self { client, endpoint: endpoint.to_string() }
     }
 
     pub async fn exists(&self, key: &Key) -> Result<bool> {
-        let url = Url::parse(&format!("{0}/{1}/xorb/{key}", self.scheme, self.endpoint))?;
+        let url = Url::parse(&format!("{}/xorb/{key}", self.endpoint))?;
         let response = self.client.head(url).send().await?;
         match response.status() {
             StatusCode::OK => Ok(true),
@@ -127,7 +122,7 @@ impl CASAPIClient {
     }
 
     pub async fn get_length(&self, key: &Key) -> Result<Option<u64>> {
-        let url = Url::parse(&format!("{0}/{1}/xorb/{key}", self.scheme, self.endpoint))?;
+        let url = Url::parse(&format!("{}/xorb/{key}", self.endpoint))?;
         let response = self.client.head(url).send().await?;
         let status = response.status();
         if status == StatusCode::NOT_FOUND {
@@ -163,21 +158,22 @@ impl CASAPIClient {
         contents: &[u8],
         chunk_boundaries: Vec<u64>,
     ) -> Result<bool> {
-        let url = Url::parse(&format!("{0}/{1}/xorb/{key}", self.scheme, self.endpoint))?;
+        let url = Url::parse(&format!("{}/xorb/{key}", self.endpoint))?;
 
-        let writer = Cursor::new(Vec::new());
-        let mut buf = BufWriter::new(writer);
+        let mut writer = Cursor::new(Vec::new());
 
         let (_,_) = CasObject::serialize(
-            &mut buf, 
+            &mut writer,
             &key.hash, 
             contents,
             &chunk_boundaries.into_iter().map(|x| x as u32).collect()
         )?;
 
         debug!("Upload: POST to {url:?} for {key:?}");
+        writer.set_position(0);
+        let data = writer.into_inner();
 
-        let response = self.client.post(url).body(buf.buffer().to_vec()).send().await?;
+        let response = self.client.post(url).body(data).send().await?;
         let response_body = response.bytes().await?;
         let response_parsed: UploadXorbResponse = serde_json::from_reader(response_body.reader())?;
 
@@ -194,7 +190,6 @@ impl CASAPIClient {
     }
 
     async fn reconstruct<W: Write>(&self, reconstruction_response: QueryReconstructionResponse, writer: &mut W) -> Result<usize> {
-
         let info = reconstruction_response.reconstruction;
         let total_len = info.iter().fold(0, |acc, x| acc + x.unpacked_length);
         let futs = info.into_iter().map(|term| {
@@ -217,7 +212,7 @@ impl CASAPIClient {
 
     /// Reconstruct the file
     async fn reconstruct_file(&self, file_id: &MerkleHash) -> Result<QueryReconstructionResponse> {
-        let url = Url::parse(&format!("{0}/{1}/reconstruction/{2}", self.scheme, self.endpoint, file_id.hex()))?;
+        let url = Url::parse(&format!("{}/reconstruction/{}", self.endpoint, file_id.hex()))?;
         
         let response = self.client.get(url).send().await?;
         let response_body = response.bytes().await?;
@@ -230,7 +225,7 @@ impl CASAPIClient {
         &self,
         key: &Key,
     ) -> Result<QueryChunkResponse> {
-        let url = Url::parse(&format!("{0}/{1}/chunk/{key}", self.scheme, self.endpoint))?;
+        let url = Url::parse(&format!("{}/chunk/{key}", self.endpoint))?;
         let response = self.client.get(url).send().await?;
         let response_body = response.bytes().await?;
         let response_parsed: QueryChunkResponse = serde_json::from_reader(response_body.reader())?;
