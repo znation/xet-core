@@ -403,7 +403,7 @@ dependencies = [
  "chrono",
  "lazy_static",
  "lru",
- "merklehash 0.14.5",
+ "merklehash",
  "mockall",
  "prometheus",
  "rand 0.8.5",
@@ -443,7 +443,7 @@ dependencies = [
  "lazy_static",
  "lz4",
  "merkledb",
- "merklehash 0.14.5",
+ "merklehash",
  "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-jaeger",
@@ -478,7 +478,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "http 1.1.0",
- "merklehash 0.14.5",
+ "merklehash",
  "rand 0.8.5",
  "tempfile",
  "tracing",
@@ -490,7 +490,7 @@ name = "cas_types"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "merklehash 0.14.5 (git+https://github.com/xetdata/xet-core)",
+ "merklehash",
  "serde",
  "serde_repr",
 ]
@@ -902,7 +902,7 @@ dependencies = [
  "lz4",
  "mdb_shard",
  "merkledb",
- "merklehash 0.14.5",
+ "merklehash",
  "mockall",
  "mockall_double",
  "mockstream",
@@ -1940,7 +1940,7 @@ checksum = "c0ff37bd590ca25063e35af745c343cb7a0271906fb7b37e4813e8f79f00268d"
 dependencies = [
  "bitflags 2.6.0",
  "libc",
- "redox_syscall 0.5.3",
+ "redox_syscall 0.5.4",
 ]
 
 [[package]]
@@ -1999,19 +1999,18 @@ dependencies = [
 
 [[package]]
 name = "lz4"
-version = "1.26.0"
+version = "1.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "958b4caa893816eea05507c20cfe47574a43d9a697138a7872990bba8a0ece68"
+checksum = "a231296ca742e418c43660cb68e082486ff2538e8db432bc818580f3965025ed"
 dependencies = [
- "libc",
  "lz4-sys",
 ]
 
 [[package]]
 name = "lz4-sys"
-version = "1.10.0"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "109de74d5d2353660401699a4174a4ff23fcc649caf553df71933c7fb45ad868"
+checksum = "fcb44a01837a858d47e5a630d2ccf304c8efcc4b83b8f9f75b7a9ee4fcc6e57d"
 dependencies = [
  "cc",
  "libc",
@@ -2042,7 +2041,7 @@ dependencies = [
  "binary-heap-plus",
  "clap 3.2.25",
  "lazy_static",
- "merklehash 0.14.5",
+ "merklehash",
  "more-asserts",
  "rand 0.8.5",
  "regex",
@@ -2076,7 +2075,7 @@ dependencies = [
  "gearhash",
  "itertools 0.10.5",
  "lazy_static",
- "merklehash 0.14.5",
+ "merklehash",
  "parutils",
  "rand 0.8.5",
  "rand_chacha",
@@ -2096,23 +2095,6 @@ dependencies = [
 [[package]]
 name = "merklehash"
 version = "0.14.5"
-dependencies = [
- "blake3",
- "generic-array",
- "heed",
- "rand 0.8.5",
- "rand_chacha",
- "rand_core 0.6.4",
- "safe-transmute",
- "serde",
- "sha3",
- "structopt",
-]
-
-[[package]]
-name = "merklehash"
-version = "0.14.5"
-source = "git+https://github.com/xetdata/xet-core#469028007186fd2cbcce3cbda4b78ea8b99c5818"
 dependencies = [
  "blake3",
  "generic-array",
@@ -2349,9 +2331,9 @@ dependencies = [
 
 [[package]]
 name = "once_cell"
-version = "1.19.0"
+version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fdb12b2476b595f9358c5161aa467c2438859caa136dec86c26fdd2efe17b92"
+checksum = "33ea5043e58958ee56f3e15a90aee535795cd7dfd319846288d93c5b57d85cbe"
 
 [[package]]
 name = "oorandom"
@@ -2561,7 +2543,7 @@ checksum = "1e401f977ab385c9e4e3ab30627d6f26d00e2c73eef317493c4ec6d468726cf8"
 dependencies = [
  "cfg-if 1.0.0",
  "libc",
- "redox_syscall 0.5.3",
+ "redox_syscall 0.5.4",
  "smallvec",
  "windows-targets 0.52.6",
 ]
@@ -3025,9 +3007,9 @@ dependencies = [
 
 [[package]]
 name = "redox_syscall"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a908a6e00f1fdd0dfd9c0eb08ce85126f6d8bbda50017e74bc4a4b7d4a926a4"
+checksum = "0884ad60e090bf1345b93da0a5de8923c93884cd03f40dfcfddd3b4bee661853"
 dependencies = [
  "bitflags 2.6.0",
 ]
@@ -3258,9 +3240,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "0.38.36"
+version = "0.38.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f55e80d50763938498dd5ebb18647174e0c76dc38c5505294bb224624f30f36"
+checksum = "8acb788b847c24f28525660c4d7758620a7210875711f79e7f663cc152726811"
 dependencies = [
  "bitflags 2.6.0",
  "errno",
@@ -3589,29 +3571,29 @@ dependencies = [
  "bincode",
  "bytes",
  "cas_client",
+ "cas_types",
  "clap 2.34.0",
  "heed",
  "http 0.2.12",
- "hyper 0.14.30",
  "itertools 0.10.5",
  "lazy_static",
  "mdb_shard",
  "merkledb",
- "merklehash 0.14.5",
+ "merklehash",
  "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-jaeger",
- "prost",
  "rand 0.8.5",
+ "reqwest",
  "retry_strategy",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-retry",
- "tonic",
  "tower",
  "tracing",
  "tracing-opentelemetry",
+ "url",
  "utils",
  "uuid",
  "xet_error",
@@ -4525,9 +4507,9 @@ checksum = "08f95100a766bf4f8f28f90d77e0a5461bbdb219042e7679bebe79004fed8d75"
 
 [[package]]
 name = "unicode-ident"
-version = "1.0.12"
+version = "1.0.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3354b9ac3fae1ff6755cb6db53683adb661634f67557942dea4facebec0fee4b"
+checksum = "e91b56cd4cadaeb79bbf1a5645f6b4f8dc5bde8834ad5894a8db35fda9efa1fe"
 
 [[package]]
 name = "unicode-normalization"
@@ -4540,9 +4522,9 @@ dependencies = [
 
 [[package]]
 name = "unicode-segmentation"
-version = "1.11.0"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4c87d22b6e3f4a18d4d40ef354e97c90fcb14dd91d7dc0aa9d8a1172ebf7202"
+checksum = "f6ccf251212114b54433ec949fd6a7841275f9ada20dddd2f29e9ceea4501493"
 
 [[package]]
 name = "unicode-width"
@@ -4592,7 +4574,7 @@ dependencies = [
  "http 0.2.12",
  "itertools 0.10.5",
  "lazy_static",
- "merklehash 0.14.5",
+ "merklehash",
  "parking_lot 0.11.2",
  "pin-project",
  "prost",
@@ -4788,7 +4770,7 @@ version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "372d5b87f58ec45c384ba03563b03544dc5fadc3983e434b286913f5b4a9bb6d"
 dependencies = [
- "redox_syscall 0.5.3",
+ "redox_syscall 0.5.4",
  "wasite",
  "web-sys",
 ]

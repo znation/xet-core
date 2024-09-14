@@ -6,6 +6,8 @@ resolver = "2"
 members = [
     "cache",
     "cas_client",
+    "cas_object",
+    "cas_types",
     "data",
     "error_printer",
     "file_utils",
@@ -17,8 +19,6 @@ members = [
     "shard_client",
     "utils",
     "xet_error",
-    "cas_object",
-    "cas_types",
 ]
 
 exclude = [
