@@ -11,8 +11,7 @@ pub enum Endpoint {
 
 #[derive(Debug)]
 pub struct Auth {
-    pub user_id: String,
-    pub login_id: String,
+    pub token: Option<String>,
 }
 
 #[derive(Debug)]

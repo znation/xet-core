@@ -4,7 +4,7 @@ use anyhow::anyhow;
 use bytes::Buf;
 use cas::key::Key;
 use cas_types::{QueryChunkResponse, QueryReconstructionResponse, UploadXorbResponse};
-use reqwest::{StatusCode, Url};
+use reqwest::{header::{HeaderMap, HeaderValue}, StatusCode, Url};
 use serde::{de::DeserializeOwned, Serialize};
 
 use bytes::Bytes;
@@ -82,9 +82,9 @@ impl Client for RemoteClient {
 }
 
 impl RemoteClient {
-    pub async fn from_config(endpoint: String) -> Self {
-        Self {
-            client: CASAPIClient::new(&endpoint),
+    pub async fn from_config(endpoint: String, token: Option<String>) -> Self {
+        Self { 
+            client: CASAPIClient::new(&endpoint, token) 
         }
     }
 }
@@ -93,20 +93,22 @@ impl RemoteClient {
 pub struct CASAPIClient {
     client: reqwest::Client,
     endpoint: String,
+    token: Option<String>,
 }
 
 impl Default for CASAPIClient {
     fn default() -> Self {
-        Self::new(CAS_ENDPOINT)
+        Self::new(CAS_ENDPOINT, None)
     }
 }
 
 impl CASAPIClient {
-    pub fn new(endpoint: &str) -> Self {
+    pub fn new(endpoint: &str, token: Option<String>) -> Self {
         let client = reqwest::Client::builder().build().unwrap();
         Self {
             client,
             endpoint: endpoint.to_string(),
+            token
         }
     }
 
@@ -222,12 +224,17 @@ impl CASAPIClient {
     /// Reconstruct the file
     async fn reconstruct_file(&self, file_id: &MerkleHash) -> Result<QueryReconstructionResponse> {
         let url = Url::parse(&format!(
-            "{}/reconstruction/{}",
-            self.endpoint,
+            "{}/reconstruction/{}", 
+            self.endpoint, 
             file_id.hex()
         ))?;
 
-        let response = self.client.get(url).send().await?;
+        let mut headers = HeaderMap::new();
+        if let Some(tok) = &self.token {
+            headers.insert("Authorization", HeaderValue::from_str(&format!("Bearer {}", tok)).unwrap());
+        }
+
+        let response = self.client.get(url).headers(headers).send().await?;
         let response_body = response.bytes().await?;
         let response_parsed: QueryReconstructionResponse =
             serde_json::from_reader(response_body.reader())?;
@@ -290,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn test_basic_put() {
         // Arrange
-        let rc = RemoteClient::from_config(CAS_ENDPOINT.to_string()).await;
+        let rc = RemoteClient::from_config(CAS_ENDPOINT.to_string(), None).await;
         let prefix = PREFIX_DEFAULT;
         let (hash, data, chunk_boundaries) = gen_dummy_xorb(3, 10248, true);
 

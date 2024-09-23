@@ -74,8 +74,7 @@ fn default_clean_config() -> Result<TranslatorConfig> {
         cas_storage_config: StorageConfig {
             endpoint: Endpoint::FileSystem(path.join("xorbs")),
             auth: Auth {
-                user_id: "".into(),
-                login_id: "".into(),
+                token: None,
             },
             prefix: "default".into(),
             cache_config: Some(CacheConfig {
@@ -88,8 +87,7 @@ fn default_clean_config() -> Result<TranslatorConfig> {
         shard_storage_config: StorageConfig {
             endpoint: Endpoint::FileSystem(path.join("xorbs")),
             auth: Auth {
-                user_id: "".into(),
-                login_id: "".into(),
+                token: None,
             },
             prefix: "default-merkledb".into(),
             cache_config: Some(CacheConfig {
@@ -123,8 +121,7 @@ fn default_smudge_config() -> Result<TranslatorConfig> {
         cas_storage_config: StorageConfig {
             endpoint: Endpoint::FileSystem(path.join("xorbs")),
             auth: Auth {
-                user_id: "".into(),
-                login_id: "".into(),
+                token: None,
             },
             prefix: "default".into(),
             cache_config: Some(CacheConfig {
@@ -137,8 +134,7 @@ fn default_smudge_config() -> Result<TranslatorConfig> {
         shard_storage_config: StorageConfig {
             endpoint: Endpoint::FileSystem(path.join("xorbs")),
             auth: Auth {
-                user_id: "".into(),
-                login_id: "".into(),
+                token: None,
             },
             prefix: "default-merkledb".into(),
             cache_config: Some(CacheConfig {
@@ -234,7 +230,7 @@ async fn smudge(mut reader: impl Read, mut writer: impl Write) -> Result<()> {
     let translator = PointerFileTranslator::new(default_smudge_config()?).await?;
 
     translator
-        .smudge_file_from_pointer(&pointer_file, &mut writer, None)
+        .smudge_file_from_pointer(&pointer_file, &mut writer, None, None, None)
         .await?;
 
     Ok(())

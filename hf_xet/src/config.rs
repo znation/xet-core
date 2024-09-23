@@ -5,7 +5,7 @@ use data::{DEFAULT_BLOCK_SIZE, errors};
 
 pub const SMALL_FILE_THRESHOLD: usize = 1;
 
-pub fn default_config(endpoint: String) -> errors::Result<TranslatorConfig> {
+pub fn default_config(endpoint: String, token: Option<String>) -> errors::Result<TranslatorConfig> {
     let path = current_dir()?.join(".xet");
     fs::create_dir_all(&path)?;
 
@@ -14,8 +14,7 @@ pub fn default_config(endpoint: String) -> errors::Result<TranslatorConfig> {
         cas_storage_config: StorageConfig {
             endpoint: Endpoint::Server(endpoint.clone()),
             auth: Auth {
-                user_id: "".into(),
-                login_id: "".into(),
+                token: token.clone(),
             },
             prefix: "default".into(),
             cache_config: Some(CacheConfig {
@@ -28,8 +27,7 @@ pub fn default_config(endpoint: String) -> errors::Result<TranslatorConfig> {
         shard_storage_config: StorageConfig {
             endpoint: Endpoint::Server(endpoint),
             auth: Auth {
-                user_id: "".into(),
-                login_id: "".into(),
+                token: token,
             },
             prefix: "default-merkledb".into(),
             cache_config: Some(CacheConfig {
