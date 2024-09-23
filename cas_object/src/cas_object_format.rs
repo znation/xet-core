@@ -1,4 +1,5 @@
 use bytes::Buf;
+use merkledb::{prelude::MerkleDBHighLevelMethodsV1, Chunk, MerkleMemDB};
 use merklehash::{DataHash, MerkleHash};
 use std::{
     cmp::min,
@@ -454,6 +455,12 @@ impl CasObject {
         chunk_boundaries: &Vec<u32>,
         compression_scheme: CompressionScheme,
     ) -> Result<(Self, usize), CasObjectError> {
+
+        // validate hash against contents
+        if !Self::validate_root_hash(data, chunk_boundaries, hash) {
+            return Err(CasObjectError::HashMismatch);
+        }
+
         let mut cas = CasObject::default();
         cas.info.cashash.copy_from_slice(hash.as_slice());
         cas.info.num_chunks = chunk_boundaries.len() as u32 + 1; // extra entry for dummy, see [chunk_size_info] for details.
@@ -473,7 +480,6 @@ impl CasObject {
             let chunk_size = chunk_boundary - raw_start_idx;
 
             // now serialize chunk directly to writer (since chunks come first!)
-            // TODO: add compression scheme to this call
             let chunk_written_bytes =
                 serialize_chunk(&chunk_raw_bytes, writer, compression_scheme)?;
             total_written_bytes += chunk_written_bytes;
@@ -506,15 +512,40 @@ impl CasObject {
 
         Ok((cas, total_written_bytes))
     }
+
+    pub fn validate_root_hash(data: &[u8], chunk_boundaries: &[u32], hash: &MerkleHash) -> bool {
+        // at least 1 chunk, and last entry in chunk boundary must match the length
+        if chunk_boundaries.is_empty()
+            || chunk_boundaries[chunk_boundaries.len() - 1] as usize != data.len()
+        {
+            return false;
+        }
+
+        let mut chunks: Vec<Chunk> = Vec::new();
+        let mut left_edge: usize = 0;
+        for i in chunk_boundaries {
+            let right_edge = *i as usize;
+            let hash = merklehash::compute_data_hash(&data[left_edge..right_edge]);
+            let length = right_edge - left_edge;
+            chunks.push(Chunk { hash, length });
+            left_edge = right_edge;
+        }
+
+        let mut db = MerkleMemDB::default();
+        let mut staging = db.start_insertion_staging();
+        db.add_file(&mut staging, &chunks);
+        let ret = db.finalize(staging);
+        *ret.hash() == *hash
+    }
+
 }
 
 #[cfg(test)]
 mod tests {
 
-    use crate::cas_chunk_format::serialize_chunk;
-
     use super::*;
-    use merklehash::compute_data_hash;
+    use crate::cas_chunk_format::serialize_chunk;
+    use merkledb::{prelude::MerkleDBHighLevelMethodsV1, Chunk, MerkleMemDB};
     use rand::Rng;
     use std::io::Cursor;
 
@@ -633,9 +664,9 @@ mod tests {
         chunk_size_info.push(chunk_info);
 
         c.info.num_chunks = chunk_size_info.len() as u32;
-
-        c.info.cashash = compute_data_hash(&writer.get_ref());
         c.info.chunk_size_info = chunk_size_info;
+
+        c.info.cashash = gen_hash(&data_contents_raw, &c.get_chunk_boundaries());
 
         // now serialize info to end Xorb length
         let len = c.info.serialize(&mut writer).unwrap();
@@ -644,6 +675,92 @@ mod tests {
         writer.write_all(&c.info_length.to_le_bytes()).unwrap();
 
         (c, writer.get_ref().to_vec(), data_contents_raw)
+    }
+
+    fn gen_hash(data: &[u8], chunk_boundaries: &[u32]) -> DataHash {
+        let mut chunks: Vec<Chunk> = Vec::new();
+        let mut left_edge: usize = 0;
+        for i in chunk_boundaries {
+            let right_edge = *i as usize;
+            let hash = merklehash::compute_data_hash(&data[left_edge..right_edge]);
+            let length = right_edge - left_edge;
+            chunks.push(Chunk { hash, length });
+            left_edge = right_edge;
+        }
+
+        let mut db = MerkleMemDB::default();
+        let mut staging = db.start_insertion_staging();
+        db.add_file(&mut staging, &chunks);
+        let ret = db.finalize(staging);
+        *ret.hash()
+    }
+
+    #[test]
+    fn test_compress_decompress() {
+        // Arrange
+        let (c, _cas_data, raw_data) = build_cas_object(55, 53212, false, true); 
+        let hash = gen_hash(&&raw_data, &c.get_chunk_boundaries());
+
+        // Act & Assert
+        let mut writer: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+        assert!(CasObject::serialize(
+            &mut writer,
+            &c.info.cashash,
+            &raw_data,
+            &c.get_chunk_boundaries(),
+            CompressionScheme::LZ4
+        )
+        .is_ok());
+
+        let mut reader = writer.clone();
+        reader.set_position(0);
+        let res = CasObject::deserialize(&mut reader);
+        assert!(res.is_ok());
+        let c = res.unwrap();
+
+        let c_bytes = c.get_all_bytes(&mut reader).unwrap();
+        let c_boundaries = c.get_chunk_boundaries();
+        let c_hash = gen_hash(&c_bytes, &c_boundaries);
+
+        let mut writer: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+        assert!(CasObject::serialize(
+            &mut writer,
+            &c_hash,
+            &c_bytes,
+            &c_boundaries,
+            CompressionScheme::None
+        )
+        .is_ok());
+
+        let mut reader = writer.clone();
+        reader.set_position(0);
+        let res = CasObject::deserialize(&mut reader);
+        assert!(res.is_ok());
+        let c2 = res.unwrap();
+
+        assert_eq!(hash, c_hash);
+        assert_eq!(c.info.cashash, hash);
+        assert_eq!(c2.info.cashash, c.info.cashash);
+    }
+
+    #[test]
+    fn test_hash_generation_compression() {
+        // Arrange
+        let (c, cas_data, raw_data) = build_cas_object(55, 53212, false, true);
+        // Act & Assert
+        let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+        assert!(CasObject::serialize(
+            &mut buf,
+            &c.info.cashash,
+            &raw_data,
+            &c.get_chunk_boundaries(),
+            CompressionScheme::LZ4
+        )
+        .is_ok());
+
+        assert_eq!(c.info.cashash, gen_hash(&raw_data, &c.get_chunk_boundaries()));
+        assert_eq!(raw_data, c.get_all_bytes(&mut buf).unwrap());
+        assert_eq!(&cas_data, buf.get_ref());
     }
 
     #[test]
