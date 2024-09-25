@@ -1434,6 +1434,8 @@ dependencies = [
  "parutils",
  "pyo3",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
