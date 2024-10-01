@@ -2,24 +2,23 @@ use std::io::{Cursor, Write};
 
 use anyhow::anyhow;
 use bytes::Buf;
-use cas::key::Key;
-use cas_types::{QueryChunkResponse, QueryReconstructionResponse, UploadXorbResponse};
-use reqwest::{
-    header::{HeaderMap, HeaderValue},
-    StatusCode, Url,
-};
-use serde::{de::DeserializeOwned, Serialize};
-
 use bytes::Bytes;
-use cas_object::CasObject;
-use cas_types::CASReconstructionTerm;
+use reqwest::{StatusCode, Url};
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, Middleware};
+use serde::{de::DeserializeOwned, Serialize};
 use tracing::{debug, warn};
 
-use crate::{error::Result, CasClientError};
-
+use cas::auth::AuthConfig;
+use cas::key::Key;
+use cas_object::CasObject;
+use cas_types::CASReconstructionTerm;
+use cas_types::{QueryChunkResponse, QueryReconstructionResponse, UploadXorbResponse};
+use error_printer::OptionPrinter;
 use merklehash::MerkleHash;
 
 use crate::Client;
+use crate::{error::Result, AuthMiddleware, CasClientError};
+
 pub const CAS_ENDPOINT: &str = "http://localhost:8080";
 pub const PREFIX_DEFAULT: &str = "default";
 
@@ -84,44 +83,37 @@ impl Client for RemoteClient {
 }
 
 impl RemoteClient {
-    pub async fn from_config(endpoint: String, token: Option<String>) -> Self {
+    pub async fn from_config(endpoint: String, auth_config: &Option<AuthConfig>) -> Self {
         Self {
-            client: CASAPIClient::new(&endpoint, token),
+            client: CASAPIClient::new(&endpoint, auth_config),
         }
     }
 }
 
 #[derive(Debug)]
 pub struct CASAPIClient {
-    client: reqwest::Client,
+    client: ClientWithMiddleware,
     endpoint: String,
-    token: Option<String>,
 }
 
 impl Default for CASAPIClient {
     fn default() -> Self {
-        Self::new(CAS_ENDPOINT, None)
+        Self::new(CAS_ENDPOINT, &None)
     }
 }
 
 impl CASAPIClient {
-    pub fn new(endpoint: &str, token: Option<String>) -> Self {
-        let client = reqwest::Client::builder().build().unwrap();
+    pub fn new(endpoint: &str, auth_config: &Option<AuthConfig>) -> Self {
+        let client = build_reqwest_client(auth_config).unwrap();
         Self {
             client,
             endpoint: endpoint.to_string(),
-            token,
         }
     }
 
     pub async fn exists(&self, key: &Key) -> Result<bool> {
         let url = Url::parse(&format!("{}/xorb/{key}", self.endpoint))?;
-        let response = self
-            .client
-            .head(url)
-            .headers(self.request_headers())
-            .send()
-            .await?;
+        let response = self.client.head(url).send().await?;
         match response.status() {
             StatusCode::OK => Ok(true),
             StatusCode::NOT_FOUND => Ok(false),
@@ -133,12 +125,7 @@ impl CASAPIClient {
 
     pub async fn get_length(&self, key: &Key) -> Result<Option<u64>> {
         let url = Url::parse(&format!("{}/xorb/{key}", self.endpoint))?;
-        let response = self
-            .client
-            .head(url)
-            .headers(self.request_headers())
-            .send()
-            .await?;
+        let response = self.client.head(url).send().await?;
         let status = response.status();
         if status == StatusCode::NOT_FOUND {
             return Ok(None);
@@ -189,13 +176,7 @@ impl CASAPIClient {
         writer.set_position(0);
         let data = writer.into_inner();
 
-        let response = self
-            .client
-            .post(url)
-            .headers(self.request_headers())
-            .body(data)
-            .send()
-            .await?;
+        let response = self.client.post(url).body(data).send().await?;
         let response_body = response.bytes().await?;
         let response_parsed: UploadXorbResponse = serde_json::from_reader(response_body.reader())?;
 
@@ -247,12 +228,7 @@ impl CASAPIClient {
             file_id.hex()
         ))?;
 
-        let response = self
-            .client
-            .get(url)
-            .headers(self.request_headers())
-            .send()
-            .await?;
+        let response = self.client.get(url).send().await?;
         let response_body = response.bytes().await?;
         let response_parsed: QueryReconstructionResponse =
             serde_json::from_reader(response_body.reader())?;
@@ -262,27 +238,11 @@ impl CASAPIClient {
 
     pub async fn shard_query_chunk(&self, key: &Key) -> Result<QueryChunkResponse> {
         let url = Url::parse(&format!("{}/chunk/{key}", self.endpoint))?;
-        let response = self
-            .client
-            .get(url)
-            .headers(self.request_headers())
-            .send()
-            .await?;
+        let response = self.client.get(url).send().await?;
         let response_body = response.bytes().await?;
         let response_parsed: QueryChunkResponse = serde_json::from_reader(response_body.reader())?;
 
         Ok(response_parsed)
-    }
-
-    fn request_headers(&self) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        if let Some(tok) = &self.token {
-            headers.insert(
-                "Authorization",
-                HeaderValue::from_str(&format!("Bearer {}", tok)).unwrap(),
-            );
-        }
-        headers
     }
 
     async fn post_json<ReqT, RespT>(&self, url: Url, request_body: &ReqT) -> Result<RespT>
@@ -330,22 +290,49 @@ async fn get_one(term: &CASReconstructionTerm) -> Result<Bytes> {
     Ok(Bytes::from(sliced))
 }
 
+/// builds the client to talk to CAS.
+pub fn build_reqwest_client(
+    auth_config: &Option<AuthConfig>,
+) -> std::result::Result<ClientWithMiddleware, reqwest::Error> {
+    let auth_middleware = auth_config
+        .as_ref()
+        .map(AuthMiddleware::from)
+        .info_none("CAS auth disabled");
+    let reqwest_client = reqwest::Client::builder().build()?;
+    Ok(ClientBuilder::new(reqwest_client)
+        .maybe_with(auth_middleware)
+        .build())
+}
+
+/// Helper trait to allow the reqwest_middleware client to optionally add a middleware.
+trait OptionalMiddleware {
+    fn maybe_with<M: Middleware>(self, middleware: Option<M>) -> Self;
+}
+
+impl OptionalMiddleware for ClientBuilder {
+    fn maybe_with<M: Middleware>(self, middleware: Option<M>) -> Self {
+        match middleware {
+            Some(m) => self.with(m),
+            None => self,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-
-    use merkledb::{prelude::MerkleDBHighLevelMethodsV1, Chunk, MerkleMemDB};
-    use merklehash::DataHash;
     use rand::Rng;
     use tracing_test::traced_test;
 
     use super::*;
+    use merkledb::{prelude::MerkleDBHighLevelMethodsV1, Chunk, MerkleMemDB};
+    use merklehash::DataHash;
 
     #[ignore]
     #[traced_test]
     #[tokio::test]
     async fn test_basic_put() {
         // Arrange
-        let rc = RemoteClient::from_config(CAS_ENDPOINT.to_string(), None).await;
+        let rc = RemoteClient::from_config(CAS_ENDPOINT.to_string(), &None).await;
         let prefix = PREFIX_DEFAULT;
         let (hash, data, chunk_boundaries) = gen_dummy_xorb(3, 10248, true);
 
