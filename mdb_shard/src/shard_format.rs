@@ -5,10 +5,9 @@ use crate::file_structs::*;
 use crate::interpolation_search::search_on_sorted_u64s;
 use crate::shard_in_memory::MDBInMemoryShard;
 use crate::utils::truncate_hash;
-use merklehash::MerkleHash;
-use serde::{Deserialize, Serialize};
+use merklehash::{HMACKey, MerkleHash};
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{copy, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::sync::Arc;
 use tracing::debug;
@@ -77,7 +76,7 @@ impl MDBShardFileHeader {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MDBShardFileFooter {
     pub version: u64,
     pub file_info_offset: u64,
@@ -88,6 +87,7 @@ pub struct MDBShardFileFooter {
     pub cas_lookup_num_entry: u64,
     pub chunk_lookup_offset: u64,
     pub chunk_lookup_num_entry: u64,
+    pub chunk_hash_hmac_key: HMACKey, // If zero, then no key.
 
     // More locations to stick in here if needed.
     _buffer: [u64; 7],
@@ -109,6 +109,7 @@ impl Default for MDBShardFileFooter {
             cas_lookup_num_entry: 0,
             chunk_lookup_offset: 0,
             chunk_lookup_num_entry: 0,
+            chunk_hash_hmac_key: HMACKey::default(), // No HMAC key
             _buffer: [0u64; 7],
             stored_bytes_on_disk: 0,
             materialized_bytes: 0,
@@ -129,6 +130,7 @@ impl MDBShardFileFooter {
         write_u64(writer, self.cas_lookup_num_entry)?;
         write_u64(writer, self.chunk_lookup_offset)?;
         write_u64(writer, self.chunk_lookup_num_entry)?;
+        write_hash(writer, &self.chunk_hash_hmac_key)?;
         write_u64s(writer, &self._buffer)?;
         write_u64(writer, self.stored_bytes_on_disk)?;
         write_u64(writer, self.materialized_bytes)?;
@@ -144,7 +146,7 @@ impl MDBShardFileFooter {
         // Do a version check as a simple guard against using this in an old repository
         if version != MDB_SHARD_FOOTER_VERSION {
             return Err(MDBShardError::ShardVersionError(format!(
-                "Error: Expected header version {MDB_SHARD_FOOTER_VERSION}, got {version}"
+                "Error: Expected footer version {MDB_SHARD_FOOTER_VERSION}, got {version}"
             )));
         }
 
@@ -158,6 +160,7 @@ impl MDBShardFileFooter {
             cas_lookup_num_entry: read_u64(reader)?,
             chunk_lookup_offset: read_u64(reader)?,
             chunk_lookup_num_entry: read_u64(reader)?,
+            chunk_hash_hmac_key: read_hash(reader)?,
             ..Default::default()
         };
         read_u64s(reader, &mut obj._buffer)?;
@@ -239,11 +242,11 @@ impl MDBShardInfo {
 
         // Move cursor to beginning of shard file.
         reader.rewind()?;
-        obj.header = MDBShardFileHeader::deserialize(reader)?;
+        obj.header = MDBShardFileHeader::deserialize(reader).unwrap();
 
         // Move cursor to end of shard file minus footer size.
         reader.seek(SeekFrom::End(-MDB_SHARD_FOOTER_SIZE))?;
-        obj.metadata = MDBShardFileFooter::deserialize(reader)?;
+        obj.metadata = MDBShardFileFooter::deserialize(reader).unwrap();
 
         Ok(obj)
     }
@@ -414,6 +417,18 @@ impl MDBShardInfo {
         ))
     }
 
+    pub fn chunk_hashes_protected(&self) -> bool {
+        self.metadata.chunk_hash_hmac_key != HMACKey::default()
+    }
+
+    pub fn chunk_hmac_key(&self) -> Option<HMACKey> {
+        if self.metadata.chunk_hash_hmac_key == HMACKey::default() {
+            None
+        } else {
+            Some(self.metadata.chunk_hash_hmac_key)
+        }
+    }
+
     pub fn get_file_info_index_by_hash<R: Read + Seek>(
         &self,
         reader: &mut R,
@@ -467,14 +482,14 @@ impl MDBShardInfo {
     pub fn get_cas_info_index_by_chunk<R: Read + Seek>(
         &self,
         reader: &mut R,
-        chunk_hash: &MerkleHash,
+        unkeyed_chunk_hash: &MerkleHash,
         dest_indices: &mut [(u32, u32); 8],
     ) -> Result<usize> {
         let num_indices = search_on_sorted_u64s(
             reader,
             self.metadata.chunk_lookup_offset,
             self.metadata.chunk_lookup_num_entry,
-            truncate_hash(chunk_hash),
+            truncate_hash(&self.keyed_chunk_hash(unkeyed_chunk_hash)),
             |reader| (Ok((read_u32(reader)?, read_u32(reader)?))),
             dest_indices,
         )?;
@@ -485,7 +500,7 @@ impl MDBShardInfo {
             debug!(
                 "Found {:?} or more collisions when searching for truncated hash {:?}",
                 dest_indices.len(),
-                truncate_hash(chunk_hash)
+                truncate_hash(unkeyed_chunk_hash)
             );
         }
 
@@ -576,6 +591,17 @@ impl MDBShardInfo {
         Ok(cas_blocks)
     }
 
+    /// Returns the keyed chunk hash for the shard.
+    #[inline]
+    pub fn keyed_chunk_hash(&self, chunk_hash: impl AsRef<MerkleHash>) -> MerkleHash {
+        let chunk_hash = *chunk_hash.as_ref();
+        if self.metadata.chunk_hash_hmac_key != HMACKey::default() {
+            chunk_hash.hmac(self.metadata.chunk_hash_hmac_key)
+        } else {
+            chunk_hash
+        }
+    }
+
     /// Returns a vector holding all the chunk hashes along with their (cas idx, entry idx) locations
     pub fn read_all_cas_blocks_full<R: Read + Seek>(
         &self,
@@ -624,9 +650,9 @@ impl MDBShardInfo {
 
         // Check each file info if the file hash matches.
         for &file_entry_index in dest_indices.iter().take(num_indices) {
-            let mdb_file = self.read_file_info(reader, file_entry_index)?;
-            if mdb_file.metadata.file_hash == *file_hash {
-                return Ok(Some(mdb_file));
+            let mdb_file_info = self.read_file_info(reader, file_entry_index)?;
+            if mdb_file_info.metadata.file_hash == *file_hash {
+                return Ok(Some(mdb_file_info));
             }
         }
 
@@ -642,11 +668,11 @@ impl MDBShardInfo {
     pub fn chunk_hash_dedup_query_direct<R: Read + Seek>(
         &self,
         reader: &mut R,
-        query_hashes: &[MerkleHash],
+        unkeyed_query_hashes: &[MerkleHash],
         cas_entry_index: u32,
         cas_chunk_offset: u32,
     ) -> Result<Option<(usize, FileDataSequenceEntry)>> {
-        if query_hashes.is_empty() {
+        if unkeyed_query_hashes.is_empty() {
             return Ok(None);
         }
 
@@ -665,7 +691,7 @@ impl MDBShardInfo {
 
         // Now, read in data while the query hashes match.
         let first_chunk = CASChunkSequenceEntry::deserialize(reader)?;
-        if first_chunk.chunk_hash != query_hashes[0] {
+        if first_chunk.chunk_hash != self.keyed_chunk_hash(unkeyed_query_hashes[0]) {
             return Ok(None);
         }
 
@@ -681,7 +707,9 @@ impl MDBShardInfo {
 
             let chunk = CASChunkSequenceEntry::deserialize(reader)?;
 
-            if i == query_hashes.len() || chunk.chunk_hash != query_hashes[i] {
+            if i == unkeyed_query_hashes.len()
+                || chunk.chunk_hash != self.keyed_chunk_hash(unkeyed_query_hashes[i])
+            {
                 end_idx = i;
                 break;
             }
@@ -710,7 +738,7 @@ impl MDBShardInfo {
         reader: &mut R,
         query_hashes: &[MerkleHash],
     ) -> Result<Option<(usize, FileDataSequenceEntry)>> {
-        if query_hashes.is_empty() {
+        if query_hashes.is_empty() || self.metadata.chunk_lookup_num_entry == 0 {
             return Ok(None);
         }
 
@@ -734,11 +762,37 @@ impl MDBShardInfo {
         &self,
         reader: &mut R,
     ) -> Result<Vec<(u64, (u32, u32))>> {
-        reader.seek(SeekFrom::Start(self.metadata.chunk_lookup_offset))?;
+        let mut ret;
+        if self.metadata.chunk_lookup_num_entry != 0 {
+            ret = Vec::with_capacity(self.metadata.chunk_lookup_num_entry as usize);
+            reader.seek(SeekFrom::Start(self.metadata.chunk_lookup_offset))?;
 
-        let mut ret = Vec::with_capacity(self.metadata.chunk_lookup_num_entry as usize);
-        for _ in 0..self.metadata.chunk_lookup_num_entry {
-            ret.push((read_u64(reader)?, (read_u32(reader)?, read_u32(reader)?)));
+            for _ in 0..self.metadata.chunk_lookup_num_entry {
+                ret.push((read_u64(reader)?, (read_u32(reader)?, read_u32(reader)?)));
+            }
+        } else {
+            // We don't have the lookup table, so
+            let n_elements_cap = (self
+                .metadata
+                .cas_lookup_offset
+                .saturating_sub(self.metadata.cas_info_offset)) // Avoids excessive allocations and weird stuff.
+                as usize
+                / size_of::<CASChunkSequenceEntry>();
+
+            ret = Vec::with_capacity(n_elements_cap);
+
+            let mut cas_index = 0;
+
+            reader.seek(SeekFrom::Start(self.metadata.cas_info_offset))?;
+            while reader.stream_position()? < self.metadata.cas_lookup_offset {
+                let cas_header = CASChunkSequenceHeader::deserialize(reader)?;
+
+                for chunk_index in 0..cas_header.num_entries {
+                    let chunk = CASChunkSequenceEntry::deserialize(reader)?;
+                    ret.push((truncate_hash(&chunk.chunk_hash), (cas_index, chunk_index)));
+                }
+                cas_index += 1 + cas_header.num_entries;
+            }
         }
 
         Ok(ret)
@@ -875,6 +929,135 @@ impl MDBShardInfo {
         }
 
         Ok(ret)
+    }
+
+    /// Export the current shard as an hmac keyed shard, returning the number of bytes written and the hash of the resulting data.
+    pub fn export_as_keyed_shard<R: Read + Seek, W: Write>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+        hmac_key: HMACKey,
+        include_file_info: bool,
+        include_cas_lookup_table: bool,
+        include_chunk_lookup_table: bool,
+    ) -> Result<usize> {
+        // Go through each of the sections, rewriting things as needed.
+        let mut out_footer = MDBShardFileFooter::default();
+
+        // Dump out the header.
+        let mut byte_pos = 0;
+        byte_pos += self.header.serialize(writer)?;
+
+        if include_file_info {
+            reader.seek(SeekFrom::Start(self.metadata.file_info_offset))?;
+            byte_pos += copy(
+                &mut reader.take(self.metadata.cas_info_offset - self.metadata.file_info_offset),
+                writer,
+            )? as usize;
+
+            // Okay to just copy these values over as there is nothing different between the two shards
+            // up to this point.
+            out_footer.file_info_offset = self.metadata.file_info_offset;
+            out_footer.file_lookup_offset = self.metadata.file_lookup_offset;
+            out_footer.file_lookup_num_entry = self.metadata.file_lookup_num_entry;
+        } else {
+            out_footer.file_info_offset = self.metadata.file_info_offset;
+
+            // Serialize a single block of 00 bytes as a guard for sequential reading.
+            byte_pos += FileDataSequenceHeader::default().serialize(writer)?;
+
+            out_footer.file_lookup_offset = byte_pos as u64;
+            out_footer.file_lookup_num_entry = 0;
+
+            reader.seek(SeekFrom::Start(self.metadata.cas_info_offset))?;
+        }
+
+        debug_assert_eq!(reader.stream_position()?, self.metadata.cas_info_offset);
+
+        out_footer.cas_info_offset = byte_pos as u64;
+
+        // Now, go through and convert all the CAS blocks, including rehashing the CAS block chunks.
+        debug_assert_eq!(reader.stream_position()?, self.metadata.cas_info_offset);
+
+        let mut chunk_lookup = if include_chunk_lookup_table {
+            Vec::<(u64, (u32, u32))>::with_capacity(self.metadata.chunk_lookup_num_entry as usize)
+        } else {
+            Vec::<(u64, (u32, u32))>::new()
+        };
+
+        let mut cas_index = 0;
+
+        while reader.stream_position()? < self.metadata.cas_lookup_offset {
+            let cas_header = CASChunkSequenceHeader::deserialize(reader)?;
+            byte_pos += cas_header.serialize(writer)?;
+
+            for chunk_index in 0..cas_header.num_entries {
+                let mut chunk = CASChunkSequenceEntry::deserialize(reader)?;
+
+                // MAke sure we don't actually put things into an unusable state.
+                if hmac_key != HMACKey::default() {
+                    chunk.chunk_hash = chunk.chunk_hash.hmac(hmac_key);
+                }
+
+                if include_chunk_lookup_table {
+                    chunk_lookup.push((truncate_hash(&chunk.chunk_hash), (cas_index, chunk_index)));
+                }
+
+                byte_pos += chunk.serialize(writer)?;
+            }
+            cas_index += 1 + cas_header.num_entries;
+        }
+
+        out_footer.cas_lookup_offset = byte_pos as u64;
+
+        if include_cas_lookup_table {
+            // The cas lookup table should be the same, so just copy it directly
+            byte_pos += copy(
+                &mut reader
+                    .take(self.metadata.chunk_lookup_offset - self.metadata.cas_lookup_offset),
+                writer,
+            )? as usize;
+            out_footer.cas_lookup_num_entry = self.metadata.chunk_lookup_num_entry;
+        } else {
+            out_footer.cas_lookup_num_entry = 0;
+
+            // Normally we would put this in here to skip reading this section, but after this
+            // we're done with the file, and this seek is unneeded.
+            // reader.seek(SeekFrom::Start(self.metadata.chunk_lookup_offset))?;
+        }
+
+        out_footer.chunk_lookup_offset = byte_pos as u64;
+
+        if include_chunk_lookup_table {
+            // This one is different now that it's hmac keyed, so we need to rebuild it.
+            chunk_lookup.sort_by_key(|s| s.0);
+
+            for &(h, (a, b)) in chunk_lookup.iter() {
+                write_u64(writer, h)?;
+                write_u32(writer, a)?;
+                write_u32(writer, b)?;
+            }
+
+            byte_pos += chunk_lookup.len() * (size_of::<u64>() + 2 * size_of::<u32>());
+            out_footer.chunk_lookup_num_entry = chunk_lookup.len() as u64;
+        } else {
+            out_footer.chunk_lookup_num_entry = 0;
+        }
+
+        out_footer.chunk_hash_hmac_key = hmac_key;
+
+        // Copy over the stored information elsewhere
+        out_footer.materialized_bytes = self.metadata.materialized_bytes;
+        out_footer.stored_bytes = self.metadata.stored_bytes;
+
+        // And we're done here!
+        out_footer.footer_offset = byte_pos as u64;
+
+        // Write out the footer at the end.
+        byte_pos += out_footer.serialize(writer)?;
+
+        // Return the number of bytes written.
+        Ok(byte_pos)
     }
 }
 
