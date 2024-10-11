@@ -11,10 +11,17 @@ pub struct UploadXorbResponse {
     pub was_inserted: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq, PartialOrd, Ord, Default)]
 pub struct Range {
     pub start: u32,
     pub end: u32,
+}
+
+impl std::fmt::Display for Range {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Range { start, end } = self;
+        write!(f, "{start}-{end}")
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
