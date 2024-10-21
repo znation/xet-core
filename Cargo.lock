@@ -784,6 +784,7 @@ dependencies = [
  "cache",
  "cas_object",
  "cas_types",
+ "chunk_cache",
  "clap 2.34.0",
  "deadpool",
  "error_printer",

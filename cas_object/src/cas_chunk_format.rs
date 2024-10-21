@@ -131,16 +131,17 @@ pub fn deserialize_chunk_header<R: Read>(reader: &mut R) -> Result<CASChunkHeade
     Ok(result)
 }
 
-pub fn deserialize_chunk<R: Read>(reader: &mut R) -> Result<(Vec<u8>, usize), CasObjectError> {
+pub fn deserialize_chunk<R: Read>(reader: &mut R) -> Result<(Vec<u8>, usize, u32), CasObjectError> {
     let mut buf = Vec::new();
-    let bytes_read = deserialize_chunk_to_writer(reader, &mut buf)?;
-    Ok((buf, bytes_read))
+    let (compressed_chunk_size, uncompressed_chunk_size) = deserialize_chunk_to_writer(reader, &mut buf)?;
+    Ok((buf, compressed_chunk_size, uncompressed_chunk_size))
 }
 
+/// Returns the compressed chunk size along with the uncompressed chunk size as a tuple, (compressed, uncompressed)
 pub fn deserialize_chunk_to_writer<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
-) -> Result<usize, CasObjectError> {
+) -> Result<(usize, u32), CasObjectError> {
     let header = deserialize_chunk_header(reader)?;
     let mut compressed_buf = vec![0u8; header.get_compressed_length() as usize];
     reader.read_exact(&mut compressed_buf)?;
@@ -162,25 +163,33 @@ pub fn deserialize_chunk_to_writer<R: Read, W: Write>(
         )));
     }
 
-    Ok(header.get_compressed_length() as usize + CAS_CHUNK_HEADER_LENGTH)
+    Ok((header.get_compressed_length() as usize + CAS_CHUNK_HEADER_LENGTH, uncompressed_len))
 }
 
-pub fn deserialize_chunks<R: Read>(reader: &mut R) -> Result<Vec<u8>, CasObjectError> {
+pub fn deserialize_chunks<R: Read>(reader: &mut R) -> Result<(Vec<u8>, Vec<u32>), CasObjectError> {
     let mut buf = Vec::new();
-    let _ = deserialize_chunks_to_writer(reader, &mut buf)?;
-    Ok(buf)
+    let (_, chunk_byte_indices) = deserialize_chunks_to_writer(reader, &mut buf)?;
+    Ok((buf, chunk_byte_indices))
 }
 
 pub fn deserialize_chunks_to_writer<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
-) -> Result<usize, CasObjectError> {
-    let mut num_written = 0;
+) -> Result<(usize, Vec<u32>), CasObjectError> {
+    let mut num_compressed_written = 0;
+    let mut num_uncompressed_written = 0;
+    
+    // chunk indices are expected to record the byte indices of uncompressed chunks
+    // as they are read from the reader, so start with [0, len(uncompressed chunk 0..n), total length]
+    let mut chunk_byte_indices = Vec::<u32>::new();
+    chunk_byte_indices.push(num_compressed_written as u32);
 
     loop {
         match deserialize_chunk_to_writer(reader, writer) {
-            Ok(delta_written) => {
-                num_written += delta_written;
+            Ok((delta_written, uncompressed_chunk_len)) => {
+                num_compressed_written += delta_written;
+                num_uncompressed_written += uncompressed_chunk_len;
+                chunk_byte_indices.push(num_uncompressed_written); // record end of current chunk
             }
             Err(CasObjectError::InternalIOError(e)) => {
                 if e.kind() == io::ErrorKind::UnexpectedEof {
@@ -192,7 +201,7 @@ pub fn deserialize_chunks_to_writer<R: Read, W: Write>(
         }
     }
 
-    Ok(num_written)
+    Ok((num_compressed_written, chunk_byte_indices))
 }
 
 #[cfg(test)]
@@ -249,7 +258,7 @@ mod tests {
         write_chunk_header(&mut buf, &header).unwrap();
         buf.extend_from_slice(data);
 
-        let (data_copy, _) = deserialize_chunk(&mut Cursor::new(buf)).unwrap();
+        let (data_copy, _, _) = deserialize_chunk(&mut Cursor::new(buf)).unwrap();
         assert_eq!(data_copy.as_slice(), data);
     }
 
@@ -286,6 +295,17 @@ mod tests {
             let res = deserialize_chunks_to_writer(&mut Cursor::new(chunks), &mut buf);
             assert!(res.is_ok());
             assert_eq!(buf.len(), num_chunks as usize * CHUNK_SIZE);
+
+            // verify that chunk boundaries are correct
+            let (data, chunk_byte_indices) = res.unwrap();
+            assert!(data > 0);
+            assert_eq!(chunk_byte_indices.len(), num_chunks as usize + 1);
+            for i in 0..chunk_byte_indices.len() - 1 {
+                assert_eq!(
+                    chunk_byte_indices[i + 1] - chunk_byte_indices[i],
+                    CHUNK_SIZE as u32
+                );
+            }
         }
     }
 }

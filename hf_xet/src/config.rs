@@ -1,4 +1,5 @@
 use data::configurations::*;
+use data::CacheConfig;
 use data::errors;
 use std::env::current_dir;
 use std::fs;
@@ -27,7 +28,6 @@ pub fn default_config(
             cache_config: Some(CacheConfig {
                 cache_directory: path.join("cache"),
                 cache_size: 10 * 1024 * 1024 * 1024, // 10 GiB
-                cache_blocksize: 0,                  // ignored
             }),
             staging_directory: None,
         },
@@ -38,7 +38,6 @@ pub fn default_config(
             cache_config: Some(CacheConfig {
                 cache_directory: path.join("shard-cache"),
                 cache_size: 0,      // ignored
-                cache_blocksize: 0, // ignored
             }),
             staging_directory: Some(path.join("shard-session")),
         },
