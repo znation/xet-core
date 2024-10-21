@@ -16,7 +16,6 @@ utils = {path = "../utils"}
 merkledb = {path = "../merkledb"}
 merklehash = { path = "../merklehash" } 
 parutils = {path = "../parutils"}
-retry_strategy = {path = "../retry_strategy"}
 tonic = {version = "0.10.2", features = ["tls", "tls-roots", "transport"] }
 prost = "0.12.3"
 tokio = { version = "1.36", features = ["full"] }
@@ -56,6 +55,7 @@ reqwest-middleware = "0.3.3"
 serde = { version = "1.0.210", features = ["derive"] }
 cas_types = { version = "0.1.0", path = "../cas_types" }
 url = "2.5.2"
+reqwest-retry = "0.6.1"
 
 [dev-dependencies]
 trait-set = "0.3.0"
@@ -63,4 +63,5 @@ lazy_static = "1.4.0"
 tokio-stream = { version = "0.1", features = ["net"] }
 rcgen = "0.12.0"
 rand = "0.8.5"
-tracing-test = "0.2.5"
+httpmock = "0.7.0"
+tracing-test = { version = "0.2.5", features = ["no-env-filter"] }

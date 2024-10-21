@@ -2,6 +2,7 @@ use crate::error::Result;
 use async_trait::async_trait;
 use cas_types::QueryReconstructionResponse;
 use merklehash::MerkleHash;
+use reqwest_middleware::ClientWithMiddleware;
 use std::io::Write;
 
 /// A Client to the CAS (Content Addressed Storage) service to allow storage and
@@ -29,24 +30,40 @@ pub trait UploadClient {
     ) -> Result<()>;
 
     /// Check if a XORB already exists.
-    async fn exists(&self, prefix: &str, hash: &MerkleHash) -> Result<bool>;
-
-    /// Clients may do puts in the background. A flush is necessary
-    /// to enforce completion of all puts. If an error occured during any
-    /// background put it will be returned here.
-    async fn flush(&self) -> Result<()>;
+    async fn exists(
+        &self,
+        prefix: &str,
+        hash: &MerkleHash,
+    ) -> Result<bool>;
 }
 
 /// A Client to the CAS (Content Addressed Storage) service to allow reconstructing a
 /// pointer file based on FileID (MerkleHash).
+/// 
+/// To simplify this crate, it is intentional that the client does not create its own http_client or
+/// spawn its own threads. Instead, it is expected to be given the parallism harness/threadpool/queue
+/// on which it is expected to run. This allows the caller to better optimize overall system utilization
+/// by controlling the number of concurrent requests.
 #[async_trait]
 pub trait ReconstructionClient {
     /// Get a entire file by file hash.
-    async fn get_file(&self, hash: &MerkleHash, writer: &mut Box<dyn Write + Send>) -> Result<()>;
+    /// 
+    /// The http_client passed in is a non-authenticated client. This is used to directly communicate 
+    /// with the backing store (S3) to retrieve xorbs.
+    async fn get_file(
+        &self,
+        http_client: &ClientWithMiddleware,
+        hash: &MerkleHash,
+        writer: &mut Box<dyn Write + Send>,
+    ) -> Result<()>;
 
     /// Get a entire file by file hash at a specific bytes range.
+    /// 
+    /// The http_client passed in is a non-authenticated client. This is used to directly communicate 
+    /// with the backing store (S3) to retrieve xorbs.
     async fn get_file_byte_range(
         &self,
+        http_client: &ClientWithMiddleware,
         hash: &MerkleHash,
         offset: u64,
         length: u64,
@@ -68,50 +85,3 @@ pub(crate) trait Reconstructable {
         byte_range: Option<(u64, u64)>,
     ) -> Result<QueryReconstructionResponse>;
 }
-
-/*
- * If T implements Client, Arc<T> also implements Client
- */
-// #[async_trait]
-// impl<T: UploadClient + Send + Sync> UploadClient for Arc<T> {
-//     async fn put(
-//         &self,
-//         prefix: &str,
-//         hash: &MerkleHash,
-//         data: Vec<u8>,
-//         chunk_and_boundaries: Vec<(MerkleHash, u32)>,
-//     ) -> Result<()> {
-//         (**self).put(prefix, hash, data, chunk_and_boundaries).await
-//     }
-
-//     async fn exists(&self, prefix: &str, hash: &MerkleHash) -> Result<bool> {
-//         (**self).exists(prefix, hash).await
-//     }
-
-//     /// Clients may do puts in the background. A flush is necessary
-//     /// to enforce completion of all puts. If an error occured during any
-//     /// background put it will be returned here.force completion of all puts.
-//     async fn flush(&self) -> Result<()> {
-//         (**self).flush().await
-//     }
-// }
-
-// #[async_trait]
-// impl<T: ReconstructionClient + Send + Sync> ReconstructionClient for Arc<T> {
-//     /// Get a entire file by file hash.
-//     async fn get_file(&self, hash: &MerkleHash, writer: &mut Box<dyn Write + Send>) -> Result<()> {
-//         (**self).get_file(hash, writer).await
-//     }
-
-//     async fn get_file_byte_range(
-//         &self,
-//         hash: &MerkleHash,
-//         offset: u64,
-//         length: u64,
-//         writer: &mut Box<dyn Write + Send>,
-//     ) -> Result<()> {
-//         (**self)
-//             .get_file_byte_range(hash, offset, length, writer)
-//             .await
-//     }
-// }
