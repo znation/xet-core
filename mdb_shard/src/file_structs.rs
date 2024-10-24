@@ -1,10 +1,12 @@
-use crate::cas_structs::{CASChunkSequenceEntry, CASChunkSequenceHeader};
-use crate::shard_file::MDB_FILE_INFO_ENTRY_SIZE;
-use merklehash::MerkleHash;
 use std::fmt::Debug;
 use std::io::{Cursor, Read, Write};
 use std::mem::size_of;
+
+use merklehash::MerkleHash;
 use utils::serialization_utils::*;
+
+use crate::cas_structs::{CASChunkSequenceEntry, CASChunkSequenceHeader};
+use crate::shard_file::MDB_FILE_INFO_ENTRY_SIZE;
 
 pub const MDB_DEFAULT_FILE_FLAG: u32 = 0;
 pub const MDB_FILE_FLAG_WITH_VERIFICATION: u32 = 1 << 31;
@@ -23,11 +25,7 @@ pub struct FileDataSequenceHeader {
 }
 
 impl FileDataSequenceHeader {
-    pub fn new<I: TryInto<u32>>(
-        file_hash: MerkleHash,
-        num_entries: I,
-        contains_verification: bool,
-    ) -> Self
+    pub fn new<I: TryInto<u32>>(file_hash: MerkleHash, num_entries: I, contains_verification: bool) -> Self
     where
         <I as TryInto<u32>>::Error: std::fmt::Debug,
     {

@@ -28,8 +28,9 @@ pub mod version;
 
 mod output_bytes;
 
-use crate::common::{CompressionScheme, InitiateResponse};
 pub use output_bytes::output_bytes;
+
+use crate::common::{CompressionScheme, InitiateResponse};
 
 impl std::fmt::Display for common::Scheme {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -43,9 +44,7 @@ impl std::fmt::Display for common::Scheme {
 
 impl std::fmt::Display for common::EndpointConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let common::EndpointConfig {
-            host, port, scheme, ..
-        } = self;
+        let common::EndpointConfig { host, port, scheme, .. } = self;
         let scheme_parsed = common::Scheme::try_from(*scheme).unwrap_or_default();
         write!(f, "{scheme_parsed}://{host}:{port}")
     }
@@ -62,9 +61,8 @@ impl InitiateResponse {
 
 #[cfg(test)]
 mod tests {
-    use crate::common::EndpointConfig;
-
     use super::*;
+    use crate::common::EndpointConfig;
 
     #[test]
     fn test_endpoint_config_to_endpoint_string() {

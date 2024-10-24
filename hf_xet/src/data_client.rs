@@ -1,13 +1,15 @@
-use crate::config::default_config;
-use utils::auth::TokenRefresher;
-use data::errors::DataProcessingError;
-use data::{errors, PointerFile, PointerFileTranslator};
-use parutils::{tokio_par_for_each, ParallelError};
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use data::errors::DataProcessingError;
+use data::{errors, PointerFile, PointerFileTranslator};
+use parutils::{tokio_par_for_each, ParallelError};
+use utils::auth::TokenRefresher;
+
+use crate::config::default_config;
 
 /// The maximum git filter protocol packet size
 pub const MAX_CONCURRENT_UPLOADS: usize = 8; // TODO
@@ -26,11 +28,7 @@ pub async fn upload_async(
     // produce Xorbs + Shards
     // upload shards and xorbs
     // for each file, return the filehash
-    let config = default_config(
-        endpoint.unwrap_or(DEFAULT_CAS_ENDPOINT.to_string()),
-        token_info,
-        token_refresher,
-    )?;
+    let config = default_config(endpoint.unwrap_or(DEFAULT_CAS_ENDPOINT.to_string()), token_info, token_refresher)?;
 
     let processor = Arc::new(PointerFileTranslator::new(config).await?);
     let processor = &processor;
@@ -57,21 +55,13 @@ pub async fn download_async(
     token_info: Option<(String, u64)>,
     token_refresher: Option<Arc<dyn TokenRefresher>>,
 ) -> errors::Result<Vec<String>> {
-    let config = default_config(
-        endpoint.unwrap_or(DEFAULT_CAS_ENDPOINT.to_string()),
-        token_info,
-        token_refresher,
-    )?;
+    let config = default_config(endpoint.unwrap_or(DEFAULT_CAS_ENDPOINT.to_string()), token_info, token_refresher)?;
     let processor = Arc::new(PointerFileTranslator::new(config).await?);
     let processor = &processor;
-    let paths = tokio_par_for_each(
-        pointer_files,
-        MAX_CONCURRENT_DOWNLOADS,
-        |pointer_file, _| async move {
-            let proc = processor.clone();
-            smudge_file(&proc, &pointer_file).await
-        },
-    )
+    let paths = tokio_par_for_each(pointer_files, MAX_CONCURRENT_DOWNLOADS, |pointer_file, _| async move {
+        let proc = processor.clone();
+        smudge_file(&proc, &pointer_file).await
+    })
     .await
     .map_err(|e| match e {
         ParallelError::JoinError => DataProcessingError::InternalError("Join error".to_string()),
@@ -102,25 +92,22 @@ async fn clean_file(processor: &PointerFileTranslator, f: String) -> errors::Res
     Ok(pf)
 }
 
-async fn smudge_file(
-    proc: &PointerFileTranslator,
-    pointer_file: &PointerFile,
-) -> errors::Result<String> {
+async fn smudge_file(proc: &PointerFileTranslator, pointer_file: &PointerFile) -> errors::Result<String> {
     let path = PathBuf::from(pointer_file.path());
     if let Some(parent_dir) = path.parent() {
         fs::create_dir_all(parent_dir)?;
     }
     let mut f: Box<dyn Write + Send> = Box::new(File::create(&path)?);
-    proc.smudge_file_from_pointer(pointer_file, &mut f, None)
-        .await?;
+    proc.smudge_file_from_pointer(pointer_file, &mut f, None).await?;
     Ok(pointer_file.path().to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::env::current_dir;
     use std::fs::canonicalize;
+
+    use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn upload_files() {
