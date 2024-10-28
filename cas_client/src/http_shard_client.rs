@@ -100,7 +100,7 @@ impl FileReconstructor<CasClientError> for HttpShardClient {
 
         Ok(Some((
             MDBFileInfo {
-                metadata: FileDataSequenceHeader::new(*file_hash, response_info.terms.len(), false),
+                metadata: FileDataSequenceHeader::new(*file_hash, response_info.terms.len(), false, false),
                 segments: response_info
                     .terms
                     .into_iter()
@@ -109,6 +109,7 @@ impl FileReconstructor<CasClientError> for HttpShardClient {
                     })
                     .collect(),
                 verification: vec![],
+                metadata_ext: None,
             },
             None,
         )))
@@ -212,7 +213,7 @@ mod test {
 
         // test file reconstruction lookup
         let files = MDBShardInfo::read_file_info_ranges(&mut reader)?;
-        for (file_hash, _, _) in files {
+        for (file_hash, _, _, _) in files {
             let expected = shard.get_file_reconstruction_info(&file_hash)?.unwrap();
             let (result, _) = client.get_file_reconstruction_info(&file_hash).await?.unwrap();
 
