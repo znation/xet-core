@@ -1,5 +1,5 @@
 use std::cmp::{max, min};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Write};
 use std::sync::Arc;
 
@@ -7,8 +7,8 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use cas_object::CasObject;
 use cas_types::{
-    CASReconstructionFetchInfo, CASReconstructionTerm, FileRange, HexMerkleHash, HttpRange, Key,
-    QueryReconstructionResponse, UploadXorbResponse,
+    BatchQueryReconstructionResponse, CASReconstructionFetchInfo, CASReconstructionTerm, FileRange, HexMerkleHash,
+    HttpRange, Key, QueryReconstructionResponse, UploadXorbResponse,
 };
 use chunk_cache::{CacheConfig, ChunkCache, DiskCache};
 use error_printer::ErrorPrinter;
@@ -110,8 +110,43 @@ impl ReconstructionClient for RemoteClient {
         // get manifest of xorbs to download, api call to CAS
         let manifest = self.get_reconstruction(hash, byte_range.clone()).await?;
 
-        self.reconstruct_file_to_writer(http_client, manifest, byte_range, writer)
-            .await?;
+        let terms = manifest.terms;
+        let fetch_info = Arc::new(manifest.fetch_info);
+        self.reconstruct_file_to_writer(
+            http_client,
+            terms,
+            fetch_info,
+            manifest.offset_into_first_range,
+            byte_range,
+            writer,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn batch_get_file(
+        &self,
+        http_client: Arc<ClientWithMiddleware>,
+        mut files: HashMap<MerkleHash, &mut Box<dyn Write + Send>>,
+    ) -> Result<()> {
+        let requested_file_ids = files.keys().cloned().collect::<HashSet<_>>();
+        let manifest = self.batch_get_reconstruction(requested_file_ids.iter()).await?;
+        let fetch_info = Arc::new(manifest.fetch_info);
+
+        let received_file_ids: HashSet<MerkleHash> = manifest.files.keys().map(Into::into).collect::<HashSet<_>>();
+        if requested_file_ids != received_file_ids {
+            return Err(CasClientError::Other(
+                "CAS returned a batch response not matching requested files".to_string(),
+            ));
+        }
+
+        // TODO: spawn threads to reconstruct each file
+        for (hash, terms) in manifest.files {
+            let w = files.get_mut(&(hash.into())).unwrap();
+            self.reconstruct_file_to_writer(http_client.clone(), terms, fetch_info.clone(), 0, None, w)
+                .await?;
+        }
 
         Ok(())
     }
@@ -152,6 +187,39 @@ impl Reconstructable for RemoteClient {
 impl Client for RemoteClient {}
 
 impl RemoteClient {
+    async fn batch_get_reconstruction(
+        &self,
+        file_ids: impl Iterator<Item = &MerkleHash>,
+    ) -> Result<BatchQueryReconstructionResponse> {
+        let mut url_str = format!("{}/reconstructions?", self.endpoint);
+        let mut is_first = true;
+        for hash in file_ids {
+            if is_first {
+                is_first = false;
+            } else {
+                url_str.push('&');
+            }
+            url_str.push_str("file_id=");
+            url_str.push_str(hash.hex().as_str());
+        }
+        let url: Url = url_str.parse()?;
+
+        let response = self
+            .http_auth_client
+            .get(url)
+            .send()
+            .await
+            .log_error("error invoking batch reconstruction api")?
+            .error_for_status()
+            .log_error("batch reconstruction api returned error code")?;
+
+        let query_reconstruction_response: BatchQueryReconstructionResponse = response
+            .json()
+            .await
+            .log_error("error json parsing BatchQueryReconstructionResponse")?;
+        Ok(query_reconstruction_response)
+    }
+
     pub async fn upload(
         &self,
         key: &Key,
@@ -194,13 +262,12 @@ impl RemoteClient {
     async fn reconstruct_file_to_writer(
         &self,
         http_client: Arc<ClientWithMiddleware>,
-        reconstruction_response: QueryReconstructionResponse,
+        terms: Vec<CASReconstructionTerm>,
+        fetch_info: Arc<HashMap<HexMerkleHash, Vec<CASReconstructionFetchInfo>>>,
+        offset_into_first_range: u64,
         byte_range: Option<FileRange>,
         writer: &mut Box<dyn Write + Send>,
     ) -> Result<u64> {
-        let terms = reconstruction_response.terms;
-        let fetch_info = Arc::new(reconstruction_response.fetch_info);
-
         let single_flight_group = Arc::new(singleflight::Group::new());
 
         let total_len = if let Some(range) = byte_range {
@@ -223,7 +290,7 @@ impl RemoteClient {
                 .log_error("error getting one term")?;
             let start = if i == 0 {
                 // use offset_into_first_range for the first term if needed
-                max(0, reconstruction_response.offset_into_first_range as usize)
+                max(0, offset_into_first_range as usize)
             } else {
                 0
             };
@@ -537,7 +604,9 @@ mod tests {
             let resp = client
                 .reconstruct_file_to_writer(
                     Arc::new(http_client.clone()),
-                    test.reconstruction_response,
+                    test.reconstruction_response.terms,
+                    Arc::new(test.reconstruction_response.fetch_info),
+                    test.reconstruction_response.offset_into_first_range,
                     test.range,
                     &mut writer,
                 )

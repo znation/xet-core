@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -85,6 +86,15 @@ impl ReconstructionClient for LocalTestClient {
         }
 
         Ok(())
+    }
+
+    #[allow(unused_variables)]
+    async fn batch_get_file(
+        &self,
+        http_client: Arc<ClientWithMiddleware>,
+        files: HashMap<MerkleHash, &mut Box<dyn Write + Send>>,
+    ) -> Result<(), CasClientError> {
+        todo!()
     }
 }
 
