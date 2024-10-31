@@ -234,6 +234,8 @@ impl ShardFileManager {
         let num_shards = new_shards.len();
 
         for (s, _) in new_shards {
+            s.verify_shard_integrity_debug_only();
+
             if sbkp_lg.shard_lookup_by_shard_hash.contains_key(&s.shard_hash) {
                 continue;
             }
@@ -898,7 +900,7 @@ mod tests {
             let out_file = mdb.flush().await?.unwrap();
 
             // Verify that the file is correct
-            MDBShardFile::load_from_file(&out_file)?.verify_shard_integrity();
+            MDBShardFile::load_from_file(&out_file).unwrap().verify_shard_integrity();
 
             // Make sure it still stays together
             verify_mdb_shards_match(&mdb, &mdb_in_mem, true).await?;
@@ -947,7 +949,7 @@ mod tests {
         let tmp_dir = TempDir::new("shard_test_unkeyed")?;
         let tmp_dir_path = tmp_dir.path();
 
-        let ref_shard = create_random_shard_collection(0, tmp_dir_path, 8, &[1, 5, 10, 8], &[4, 3, 5, 9, 4, 6]).await?;
+        let ref_shard = create_random_shard_collection(0, tmp_dir_path, 2, &[1, 5, 10, 8], &[4, 3, 5, 9, 4, 6]).await?;
 
         // First, load all of these with a shard file manager and check them.
         {

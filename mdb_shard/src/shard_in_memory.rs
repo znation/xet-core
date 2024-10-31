@@ -256,6 +256,13 @@ impl MDBInMemoryShard {
 
         debug!("Wrote out in-memory shard to {full_file_name:?}.");
 
+        #[cfg(debug_assertions)]
+        {
+            use crate::MDBShardFile;
+            let shard_file = MDBShardFile::load_from_file(&full_file_name)?;
+            shard_file.verify_shard_integrity();
+        }
+
         Ok(full_file_name)
     }
 }
