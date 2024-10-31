@@ -1,3 +1,4 @@
+use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::sync::Arc;
@@ -6,11 +7,12 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use cas_object::CasObject;
 use cas_types::{
-    CASReconstructionFetchInfo, CASReconstructionTerm, HexMerkleHash, HttpRange, Key, QueryReconstructionResponse,
-    UploadXorbResponse,
+    CASReconstructionFetchInfo, CASReconstructionTerm, FileRange, HexMerkleHash, HttpRange, Key,
+    QueryReconstructionResponse, UploadXorbResponse,
 };
 use chunk_cache::{CacheConfig, ChunkCache, DiskCache};
 use error_printer::ErrorPrinter;
+use http::header::RANGE;
 use merklehash::MerkleHash;
 use reqwest::{StatusCode, Url};
 use reqwest_middleware::ClientWithMiddleware;
@@ -102,26 +104,16 @@ impl ReconstructionClient for RemoteClient {
         &self,
         http_client: Arc<ClientWithMiddleware>,
         hash: &MerkleHash,
+        byte_range: Option<FileRange>,
         writer: &mut Box<dyn Write + Send>,
     ) -> Result<()> {
         // get manifest of xorbs to download, api call to CAS
-        let manifest = self.get_reconstruction(hash, None).await?;
+        let manifest = self.get_reconstruction(hash, byte_range.clone()).await?;
 
-        self.reconstruct_file_to_writer(http_client, manifest, None, writer).await?;
+        self.reconstruct_file_to_writer(http_client, manifest, byte_range, writer)
+            .await?;
 
         Ok(())
-    }
-
-    #[allow(unused_variables)]
-    async fn get_file_byte_range(
-        &self,
-        http_client: Arc<ClientWithMiddleware>,
-        hash: &MerkleHash,
-        offset: u64,
-        length: u64,
-        writer: &mut Box<dyn Write + Send>,
-    ) -> Result<()> {
-        todo!()
     }
 }
 
@@ -130,13 +122,16 @@ impl Reconstructable for RemoteClient {
     async fn get_reconstruction(
         &self,
         file_id: &MerkleHash,
-        _bytes_range: Option<(u64, u64)>,
+        bytes_range: Option<FileRange>,
     ) -> Result<QueryReconstructionResponse> {
         let url = Url::parse(&format!("{}/reconstruction/{}", self.endpoint, file_id.hex()))?;
 
-        let response = self
-            .http_auth_client
-            .get(url)
+        let mut request = self.http_auth_client.get(url);
+        if let Some(range) = bytes_range {
+            // convert exclusive-end to inclusive-end range
+            request = request.header(RANGE, format!("{}-{}", range.start, range.end - 1))
+        }
+        let response = request
             .send()
             .await
             .log_error("error invoking reconstruction api")?
@@ -189,8 +184,6 @@ impl RemoteClient {
     /// to download files from S3/blob store using urls from the fetch information section of
     /// of the response it will use the provided http client.
     ///
-    /// TODO: respect the byte_range argument to reconstruct only a section.
-    ///
     /// To reconstruct, this function will iterate through each CASReconstructionTerm in the `terms` section
     /// of the QueryReconstructionResponse, fetching the data for that term. Each term is a range of chunks
     /// from a specific Xorb. The range is an end exclusive [start, end) chunk index range of the xorb
@@ -202,15 +195,20 @@ impl RemoteClient {
         &self,
         http_client: Arc<ClientWithMiddleware>,
         reconstruction_response: QueryReconstructionResponse,
-        _byte_range: Option<(u64, u64)>,
+        byte_range: Option<FileRange>,
         writer: &mut Box<dyn Write + Send>,
-    ) -> Result<usize> {
+    ) -> Result<u64> {
         let terms = reconstruction_response.terms;
         let fetch_info = Arc::new(reconstruction_response.fetch_info);
 
         let single_flight_group = Arc::new(singleflight::Group::new());
 
-        let total_len = terms.iter().fold(0, |acc, x| acc + x.unpacked_length);
+        let total_len = if let Some(range) = byte_range {
+            range.end - range.start
+        } else {
+            terms.iter().fold(0, |acc, x| acc + x.unpacked_length as u64)
+        };
+        let mut remaining_len = total_len;
         let term_data_futures = terms.into_iter().map(|term| {
             let http_client = http_client.clone();
             let disk_cache = self.disk_cache.clone();
@@ -218,16 +216,23 @@ impl RemoteClient {
             let single_flight_group = single_flight_group.clone();
             tokio::spawn(get_one_term(http_client, disk_cache, term, fetch_info, single_flight_group))
         });
-        for fut in term_data_futures {
+        for (i, fut) in term_data_futures.enumerate() {
             let term_data = fut
                 .await
                 .map_err(|e| CasClientError::InternalError(anyhow!("join error {e}")))?
                 .log_error("error getting one term")?;
-            writer.write_all(&term_data)?;
+            let start = if i == 0 {
+                // use offset_into_first_range for the first term if needed
+                max(0, reconstruction_response.offset_into_first_range as usize)
+            } else {
+                0
+            };
+            let end: usize = min(remaining_len + start as u64, term_data.len() as u64) as usize;
+            writer.write_all(&term_data[start..end])?;
+            remaining_len -= (end - start) as u64;
         }
-        // TODO: respect the offset_from_first_byte field of response
-        //  only necessary for range-reconstruction, not needed for full file
-        Ok(total_len as usize)
+        writer.flush()?;
+        Ok(total_len)
     }
 }
 
@@ -368,11 +373,51 @@ async fn download_range(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+    use std::sync::Mutex;
 
     use cas_object::test_utils::{build_cas_object, ChunkSize};
+    use cas_types::ChunkRange;
+    use chunk_cache::MockChunkCache;
     use tracing_test::traced_test;
 
     use super::*;
+
+    // test reconstruction contains 20 chunks, where each chunk size is 10 bytes
+    const TEST_CHUNK_RANGE: ChunkRange = ChunkRange {
+        start: 0,
+        end: TEST_NUM_CHUNKS as u32,
+    };
+    const TEST_CHUNK_SIZE: usize = 10;
+    const TEST_NUM_CHUNKS: usize = 20;
+    const TEST_UNPACKED_LEN: u32 = (TEST_CHUNK_SIZE * TEST_NUM_CHUNKS) as u32;
+
+    #[derive(Debug, Default, Clone)]
+    struct Buffer {
+        inner: Arc<Mutex<Cursor<Vec<u8>>>>,
+    }
+
+    impl Buffer {
+        pub fn value(&self) -> Vec<u8> {
+            self.inner.lock().unwrap().get_ref().clone()
+        }
+    }
+
+    impl Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.lock().map_err(|e| std::io::Error::other(format!("{e}")))?.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Read for Buffer {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.lock().map_err(|e| std::io::Error::other(format!("{e}")))?.read(buf)
+        }
+    }
 
     #[ignore = "requires a running CAS server"]
     #[traced_test]
@@ -389,5 +434,119 @@ mod tests {
 
         // Assert
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_reconstruct_file_to_writer() {
+        struct TestCase {
+            reconstruction_response: QueryReconstructionResponse,
+            range: Option<FileRange>,
+            expected_len: u64,
+            expect_error: bool,
+        }
+        let test_cases = vec![
+            // full file reconstruction
+            TestCase {
+                reconstruction_response: QueryReconstructionResponse {
+                    offset_into_first_range: 0,
+                    terms: vec![CASReconstructionTerm {
+                        hash: HexMerkleHash::default(),
+                        range: TEST_CHUNK_RANGE,
+                        unpacked_length: TEST_UNPACKED_LEN,
+                    }],
+                    fetch_info: HashMap::new(),
+                },
+                range: None,
+                expected_len: TEST_UNPACKED_LEN as u64,
+                expect_error: false,
+            },
+            // skip first 100 bytes
+            TestCase {
+                reconstruction_response: QueryReconstructionResponse {
+                    offset_into_first_range: 100,
+                    terms: vec![CASReconstructionTerm {
+                        hash: HexMerkleHash::default(),
+                        range: TEST_CHUNK_RANGE,
+                        unpacked_length: TEST_UNPACKED_LEN,
+                    }],
+                    fetch_info: HashMap::new(),
+                },
+                range: Some(FileRange {
+                    start: 100,
+                    end: TEST_UNPACKED_LEN as u64,
+                }),
+                expected_len: (TEST_UNPACKED_LEN - 100) as u64,
+                expect_error: false,
+            },
+            // skip last 100 bytes
+            TestCase {
+                reconstruction_response: QueryReconstructionResponse {
+                    offset_into_first_range: 0,
+                    terms: vec![CASReconstructionTerm {
+                        hash: HexMerkleHash::default(),
+                        range: TEST_CHUNK_RANGE,
+                        unpacked_length: TEST_UNPACKED_LEN,
+                    }],
+                    fetch_info: HashMap::new(),
+                },
+                range: Some(FileRange {
+                    start: 0,
+                    end: (TEST_UNPACKED_LEN - 100) as u64,
+                }),
+                expected_len: (TEST_UNPACKED_LEN - 100) as u64,
+                expect_error: false,
+            },
+            // skip first and last 100 bytes, 2 terms
+            TestCase {
+                reconstruction_response: QueryReconstructionResponse {
+                    offset_into_first_range: 100,
+                    terms: vec![
+                        CASReconstructionTerm {
+                            hash: HexMerkleHash::default(),
+                            range: TEST_CHUNK_RANGE,
+                            unpacked_length: TEST_UNPACKED_LEN,
+                        };
+                        2
+                    ],
+                    fetch_info: HashMap::new(),
+                },
+                range: Some(FileRange {
+                    start: 100,
+                    end: (2 * TEST_UNPACKED_LEN - 100) as u64,
+                }),
+                expected_len: (2 * TEST_UNPACKED_LEN - 200) as u64,
+                expect_error: false,
+            },
+        ];
+        for test in test_cases {
+            let mut chunk_cache = MockChunkCache::new();
+            chunk_cache
+                .expect_get()
+                .returning(|_, range| Ok(Some(vec![1; (range.end - range.start) as usize * TEST_CHUNK_SIZE])));
+
+            let http_client = http_client::build_http_client(&None).unwrap();
+            let client = RemoteClient {
+                disk_cache: Some(Arc::new(chunk_cache)),
+                http_auth_client: http_client.clone(),
+                endpoint: "".to_string(),
+            };
+
+            let v = Buffer::default();
+            let mut writer: Box<dyn Write + Send> = Box::new(v.clone());
+
+            let resp = client
+                .reconstruct_file_to_writer(
+                    Arc::new(http_client.clone()),
+                    test.reconstruction_response,
+                    test.range,
+                    &mut writer,
+                )
+                .await;
+            assert_eq!(test.expect_error, resp.is_err());
+            if !test.expect_error {
+                assert_eq!(test.expected_len, resp.unwrap());
+                assert_eq!(vec![1; test.expected_len as usize], v.value());
+            }
+        }
     }
 }
