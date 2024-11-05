@@ -12,13 +12,14 @@ use cas_types::{
 };
 use chunk_cache::{CacheConfig, ChunkCache, DiskCache};
 use error_printer::ErrorPrinter;
+use futures::StreamExt;
 use http::header::RANGE;
 use merklehash::MerkleHash;
 use reqwest::{StatusCode, Url};
 use reqwest_middleware::ClientWithMiddleware;
 use tracing::{debug, error, info};
 use utils::auth::AuthConfig;
-use utils::{singleflight, ThreadPool};
+use utils::ThreadPool;
 
 use crate::error::Result;
 use crate::interface::*;
@@ -29,11 +30,12 @@ pub const PREFIX_DEFAULT: &str = "default";
 
 const NUM_RETRIES: usize = 5;
 const BASE_RETRY_DELAY_MS: u64 = 3000;
+const NUM_CONCURRENT_RANGE_GETS: usize = 4;
 
 pub struct RemoteClient {
     endpoint: String,
     http_auth_client: ClientWithMiddleware,
-    disk_cache: Option<Arc<dyn ChunkCache>>,
+    chunk_cache: Option<Arc<dyn ChunkCache>>,
     threadpool: Arc<ThreadPool>,
 }
 
@@ -45,7 +47,7 @@ impl RemoteClient {
         cache_config: &Option<CacheConfig>,
     ) -> Self {
         // use disk cache if cache_config provided.
-        let disk_cache = if let Some(cache_config) = cache_config {
+        let chunk_cache = if let Some(cache_config) = cache_config {
             info!("Using disk cache directory: {:?}, size: {}.", cache_config.cache_directory, cache_config.cache_size);
             DiskCache::initialize(cache_config)
                 .log_error("failed to initialize cache, not using cache")
@@ -58,7 +60,7 @@ impl RemoteClient {
         Self {
             endpoint: endpoint.to_string(),
             http_auth_client: http_client::build_auth_http_client(auth, &None).unwrap(),
-            disk_cache,
+            chunk_cache,
             threadpool,
         }
     }
@@ -275,28 +277,22 @@ impl RemoteClient {
         byte_range: Option<FileRange>,
         writer: &mut Box<dyn Write + Send>,
     ) -> Result<u64> {
-        let single_flight_group = Arc::new(singleflight::Group::new(self.threadpool.clone()));
-
         let total_len = if let Some(range) = byte_range {
             range.end - range.start
         } else {
             terms.iter().fold(0, |acc, x| acc + x.unpacked_length as u64)
         };
+
+        let futs_iter = terms
+            .into_iter()
+            .map(|term| get_one_term(http_client.clone(), self.chunk_cache.clone(), term, fetch_info.clone()));
+        let mut futs_buffered_enumerated =
+            futures::stream::iter(futs_iter).buffered(NUM_CONCURRENT_RANGE_GETS).enumerate();
+
         let mut remaining_len = total_len;
-        let term_data_futures = terms.into_iter().map(|term| {
-            let http_client = http_client.clone();
-            let disk_cache = self.disk_cache.clone();
-            let fetch_info = fetch_info.clone();
-            let single_flight_group = single_flight_group.clone();
-            self.threadpool
-                .spawn(get_one_term(http_client, disk_cache, term, fetch_info, single_flight_group))
-        });
-        for (i, fut) in term_data_futures.enumerate() {
-            let term_data = fut
-                .await
-                .map_err(|e| CasClientError::InternalError(anyhow!("join error {e}")))?
-                .log_error("error getting one term")?;
-            let start = if i == 0 {
+        while let Some((term_idx, term_data_result)) = futs_buffered_enumerated.next().await {
+            let term_data = term_data_result.log_error(format!("error fetching 1 term at index {term_idx}"))?;
+            let start = if term_idx == 0 {
                 // use offset_into_first_range for the first term if needed
                 max(0, offset_into_first_range as usize)
             } else {
@@ -306,15 +302,11 @@ impl RemoteClient {
             writer.write_all(&term_data[start..end])?;
             remaining_len -= (end - start) as u64;
         }
+
         writer.flush()?;
         Ok(total_len)
     }
 }
-
-// Right now if all ranges are fetched "at once" (all tasks spawned in brief succession)
-// they may get a cache miss, and issue the S3 get, we use a singleflight group
-// to avoid double gets for these requests, with the singleflight key being the S3 url.
-pub(crate) type ChunkDataSingleFlightGroup = singleflight::Group<(Vec<u8>, Vec<u32>), CasClientError>;
 
 /// fetch the data requested for the term argument (data from a range of chunks
 /// in a xorb).
@@ -329,10 +321,9 @@ pub(crate) type ChunkDataSingleFlightGroup = singleflight::Group<(Vec<u8>, Vec<u
 /// that matches our requested CASReconstructionTerm, it is considered a bad output from the CAS API.
 pub(crate) async fn get_one_term(
     http_client: Arc<ClientWithMiddleware>,
-    disk_cache: Option<Arc<dyn ChunkCache>>,
+    chunk_cache: Option<Arc<dyn ChunkCache>>,
     term: CASReconstructionTerm,
     fetch_info: Arc<HashMap<HexMerkleHash, Vec<CASReconstructionFetchInfo>>>,
-    single_flight_group: Arc<ChunkDataSingleFlightGroup>,
 ) -> Result<Vec<u8>> {
     debug!("term: {term:?}");
 
@@ -341,7 +332,7 @@ pub(crate) async fn get_one_term(
     }
 
     // check disk cache for the exact range we want for the reconstruction term
-    if let Some(cache) = &disk_cache {
+    if let Some(cache) = &chunk_cache {
         let key = Key {
             prefix: PREFIX_DEFAULT.to_string(),
             hash: term.hash.into(),
@@ -367,22 +358,17 @@ pub(crate) async fn get_one_term(
 
     // fetch the range from blob store and deserialize the chunks
     // then put into the cache if used
-    let single_flight_group_key = fetch_term.url.as_str();
-    let fetch_term_owned = fetch_term.clone();
-    let (mut data, chunk_byte_indices) = single_flight_group
-        .work_dump_caller_info(single_flight_group_key, async move {
-            let (data, chunk_byte_indices) = download_range(http_client, &fetch_term_owned).await?;
-            // now write it to cache, the whole fetched term
-            if let Some(cache) = disk_cache {
-                let key = Key {
-                    prefix: PREFIX_DEFAULT.to_string(),
-                    hash: term.hash.into(),
-                };
-                cache.put(&key, &fetch_term_owned.range, &chunk_byte_indices, &data)?;
-            }
-            Ok((data, chunk_byte_indices))
-        })
-        .await?;
+    // let single_flight_group_key = fetch_term.url.as_str();
+    let (mut data, chunk_byte_indices) = download_range(http_client, &fetch_term).await?;
+
+    // now write it to cache, the whole fetched term
+    if let Some(cache) = chunk_cache {
+        let key = Key {
+            prefix: PREFIX_DEFAULT.to_string(),
+            hash: term.hash.into(),
+        };
+        cache.put(&key, &fetch_term.range, &chunk_byte_indices, &data)?;
+    }
 
     // if the requested range is smaller than the fetched range, trim it down to the right data
     // the requested range cannot be larger than the fetched range.
@@ -597,7 +583,7 @@ mod tests {
 
             let threadpool = Arc::new(ThreadPool::new());
             let client = RemoteClient {
-                disk_cache: Some(Arc::new(chunk_cache)),
+                chunk_cache: Some(Arc::new(chunk_cache)),
                 http_auth_client: http_client.clone(),
                 endpoint: "".to_string(),
                 threadpool: threadpool.clone(),
