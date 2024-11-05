@@ -18,7 +18,7 @@ use reqwest::{StatusCode, Url};
 use reqwest_middleware::ClientWithMiddleware;
 use tracing::{debug, error, info};
 use utils::auth::AuthConfig;
-use utils::singleflight;
+use utils::{singleflight, ThreadPool};
 
 use crate::error::Result;
 use crate::interface::*;
@@ -34,10 +34,16 @@ pub struct RemoteClient {
     endpoint: String,
     http_auth_client: ClientWithMiddleware,
     disk_cache: Option<Arc<dyn ChunkCache>>,
+    threadpool: Arc<ThreadPool>,
 }
 
 impl RemoteClient {
-    pub fn new(endpoint: &str, auth: &Option<AuthConfig>, cache_config: &Option<CacheConfig>) -> Self {
+    pub fn new(
+        threadpool: Arc<ThreadPool>,
+        endpoint: &str,
+        auth: &Option<AuthConfig>,
+        cache_config: &Option<CacheConfig>,
+    ) -> Self {
         // use disk cache if cache_config provided.
         let disk_cache = if let Some(cache_config) = cache_config {
             info!("Using disk cache directory: {:?}, size: {}.", cache_config.cache_directory, cache_config.cache_size);
@@ -53,6 +59,7 @@ impl RemoteClient {
             endpoint: endpoint.to_string(),
             http_auth_client: http_client::build_auth_http_client(auth, &None).unwrap(),
             disk_cache,
+            threadpool,
         }
     }
 }
@@ -112,11 +119,10 @@ impl ReconstructionClient for RemoteClient {
 
         let terms = manifest.terms;
         let fetch_info = Arc::new(manifest.fetch_info);
-        reconstruct_file_to_writer(
+        self.reconstruct_file_to_writer(
             http_client,
             terms,
             fetch_info,
-            self.disk_cache.clone(),
             manifest.offset_into_first_range,
             byte_range,
             writer,
@@ -145,16 +151,8 @@ impl ReconstructionClient for RemoteClient {
         // TODO: spawn threads to reconstruct each file
         for (hash, terms) in manifest.files {
             let w = files.get_mut(&(hash.into())).unwrap();
-            reconstruct_file_to_writer(
-                http_client.clone(),
-                terms,
-                fetch_info.clone(),
-                self.disk_cache.clone(),
-                0,
-                None,
-                w,
-            )
-            .await?;
+            self.reconstruct_file_to_writer(http_client.clone(), terms, fetch_info.clone(), 0, None, w)
+                .await?;
         }
 
         Ok(())
@@ -256,59 +254,61 @@ impl RemoteClient {
 
         Ok(response_parsed.was_inserted)
     }
-}
 
-/// use the reconstruction response from CAS to re-create the described file for any calls
-/// to download files from S3/blob store using urls from the fetch information section of
-/// of the response it will use the provided http client.
-///
-/// To reconstruct, this function will iterate through each CASReconstructionTerm in the `terms` section
-/// of the QueryReconstructionResponse, fetching the data for that term. Each term is a range of chunks
-/// from a specific Xorb. The range is an end exclusive [start, end) chunk index range of the xorb
-/// specified by the hash key of the CASReconstructionTerm.
-///
-/// To fetch the data for each term, this function will consult the fetch_info section of the reconstruction
-/// response. See `get_one_term`.
-pub async fn reconstruct_file_to_writer(
-    http_client: Arc<ClientWithMiddleware>,
-    terms: Vec<CASReconstructionTerm>,
-    fetch_info: Arc<HashMap<HexMerkleHash, Vec<CASReconstructionFetchInfo>>>,
-    cache: Option<Arc<dyn ChunkCache>>,
-    offset_into_first_range: u64,
-    byte_range: Option<FileRange>,
-    writer: &mut Box<dyn Write + Send>,
-) -> Result<u64> {
-    let single_flight_group = Arc::new(singleflight::Group::new());
+    /// use the reconstruction response from CAS to re-create the described file for any calls
+    /// to download files from S3/blob store using urls from the fetch information section of
+    /// of the response it will use the provided http client.
+    ///
+    /// To reconstruct, this function will iterate through each CASReconstructionTerm in the `terms` section
+    /// of the QueryReconstructionResponse, fetching the data for that term. Each term is a range of chunks
+    /// from a specific Xorb. The range is an end exclusive [start, end) chunk index range of the xorb
+    /// specified by the hash key of the CASReconstructionTerm.
+    ///
+    /// To fetch the data for each term, this function will consult the fetch_info section of the reconstruction
+    /// response. See `get_one_term`.
+    pub async fn reconstruct_file_to_writer(
+        &self,
+        http_client: Arc<ClientWithMiddleware>,
+        terms: Vec<CASReconstructionTerm>,
+        fetch_info: Arc<HashMap<HexMerkleHash, Vec<CASReconstructionFetchInfo>>>,
+        offset_into_first_range: u64,
+        byte_range: Option<FileRange>,
+        writer: &mut Box<dyn Write + Send>,
+    ) -> Result<u64> {
+        let single_flight_group = Arc::new(singleflight::Group::new(self.threadpool.clone()));
 
-    let total_len = if let Some(range) = byte_range {
-        range.end - range.start
-    } else {
-        terms.iter().fold(0, |acc, x| acc + x.unpacked_length as u64)
-    };
-    let mut remaining_len = total_len;
-    let term_data_futures = terms.into_iter().map(|term| {
-        let http_client = http_client.clone();
-        let fetch_info = fetch_info.clone();
-        let single_flight_group = single_flight_group.clone();
-        tokio::spawn(get_one_term(http_client, cache.clone(), term, fetch_info, single_flight_group))
-    });
-    for (i, fut) in term_data_futures.enumerate() {
-        let term_data = fut
-            .await
-            .map_err(|e| CasClientError::InternalError(anyhow!("join error {e}")))?
-            .log_error("error getting one term")?;
-        let start = if i == 0 {
-            // use offset_into_first_range for the first term if needed
-            max(0, offset_into_first_range as usize)
+        let total_len = if let Some(range) = byte_range {
+            range.end - range.start
         } else {
-            0
+            terms.iter().fold(0, |acc, x| acc + x.unpacked_length as u64)
         };
-        let end: usize = min(remaining_len + start as u64, term_data.len() as u64) as usize;
-        writer.write_all(&term_data[start..end])?;
-        remaining_len -= (end - start) as u64;
+        let mut remaining_len = total_len;
+        let term_data_futures = terms.into_iter().map(|term| {
+            let http_client = http_client.clone();
+            let disk_cache = self.disk_cache.clone();
+            let fetch_info = fetch_info.clone();
+            let single_flight_group = single_flight_group.clone();
+            self.threadpool
+                .spawn(get_one_term(http_client, disk_cache, term, fetch_info, single_flight_group))
+        });
+        for (i, fut) in term_data_futures.enumerate() {
+            let term_data = fut
+                .await
+                .map_err(|e| CasClientError::InternalError(anyhow!("join error {e}")))?
+                .log_error("error getting one term")?;
+            let start = if i == 0 {
+                // use offset_into_first_range for the first term if needed
+                max(0, offset_into_first_range as usize)
+            } else {
+                0
+            };
+            let end: usize = min(remaining_len + start as u64, term_data.len() as u64) as usize;
+            writer.write_all(&term_data[start..end])?;
+            remaining_len -= (end - start) as u64;
+        }
+        writer.flush()?;
+        Ok(total_len)
     }
-    writer.flush()?;
-    Ok(total_len)
 }
 
 // Right now if all ranges are fetched "at once" (all tasks spawned in brief succession)
@@ -489,23 +489,24 @@ mod tests {
 
     #[ignore = "requires a running CAS server"]
     #[traced_test]
-    #[tokio::test]
-    async fn test_basic_put() {
+    #[test]
+    fn test_basic_put() {
         // Arrange
         let prefix = PREFIX_DEFAULT;
         let (c, _, data, chunk_boundaries) =
             build_cas_object(3, ChunkSize::Random(512, 10248), cas_object::CompressionScheme::LZ4);
 
-        let client = RemoteClient::new(CAS_ENDPOINT, &None, &None);
+        let threadpool = Arc::new(ThreadPool::new());
+        let client = RemoteClient::new(threadpool.clone(), CAS_ENDPOINT, &None, &None);
         // Act
-        let result = client.put(prefix, &c.info.cashash, data, chunk_boundaries).await;
+        let result = threadpool.block_on(client.put(prefix, &c.info.cashash, data, chunk_boundaries));
 
         // Assert
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_reconstruct_file_to_writer() {
+    #[test]
+    fn test_reconstruct_file_to_writer() {
         struct TestCase {
             reconstruction_response: QueryReconstructionResponse,
             range: Option<FileRange>,
@@ -594,19 +595,26 @@ mod tests {
 
             let http_client = http_client::build_http_client(&None).unwrap();
 
+            let threadpool = Arc::new(ThreadPool::new());
+            let client = RemoteClient {
+                disk_cache: Some(Arc::new(chunk_cache)),
+                http_auth_client: http_client.clone(),
+                endpoint: "".to_string(),
+                threadpool: threadpool.clone(),
+            };
+
             let v = ThreadSafeBuffer::default();
             let mut writer: Box<dyn Write + Send> = Box::new(v.clone());
 
-            let resp = reconstruct_file_to_writer(
+            let resp = threadpool.block_on(client.reconstruct_file_to_writer(
                 Arc::new(http_client.clone()),
                 test.reconstruction_response.terms,
                 Arc::new(test.reconstruction_response.fetch_info),
-                Some(Arc::new(chunk_cache)),
                 test.reconstruction_response.offset_into_first_range,
                 test.range,
                 &mut writer,
-            )
-            .await;
+            ));
+
             assert_eq!(test.expect_error, resp.is_err());
             if !test.expect_error {
                 assert_eq!(test.expected_len, resp.unwrap());
