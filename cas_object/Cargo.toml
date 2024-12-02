@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 xet_error = { path = "../xet_error" }
+error_printer = { path = "../error_printer" }
 merkledb = { path = "../merkledb" }
 merklehash = { path = "../merklehash" }
 anyhow = "1.0.88"
@@ -20,3 +21,4 @@ tokio = {version = "1.41.1", optional = true}
 [features]
 default = []
 async_chunk_deserialize = ["dep:futures", "dep:tokio-util", "dep:tokio"]
+stream_xorb = ["async_chunk_deserialize"]
