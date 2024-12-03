@@ -7,7 +7,6 @@ use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 use crate::error::CasObjectError;
 use crate::CompressionScheme;
 
-#[cfg(feature = "async_chunk_deserialize")]
 pub mod deserialize_async;
 
 pub const CAS_CHUNK_HEADER_LENGTH: usize = size_of::<CASChunkHeader>();
@@ -267,7 +266,6 @@ mod tests {
         let data = &[1, 2, 3, 4];
         let header = CASChunkHeader::new(CompressionScheme::None, 4, 4);
         let mut buf = Vec::with_capacity(size_of::<CASChunkHeader>() + 4);
-        println!("len buf: {}", buf.len());
         write_chunk_header(&mut buf, &header).unwrap();
         buf.extend_from_slice(data);
 

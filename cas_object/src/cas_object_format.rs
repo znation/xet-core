@@ -4,7 +4,6 @@ use std::mem::size_of;
 
 use anyhow::anyhow;
 use bytes::Buf;
-#[cfg(feature = "stream_xorb")]
 use futures::AsyncReadExt;
 use merkledb::prelude::MerkleDBHighLevelMethodsV1;
 use merkledb::{Chunk, MerkleMemDB};
@@ -171,7 +170,6 @@ impl CasObjectInfo {
     /// assumes that the ident and version have already been read and verified.
     ///
     /// verifies that the length of the footer data matches the length field at the very end of the buffer
-    #[cfg(feature = "stream_xorb")]
     pub async fn deserialize_async<R: futures::io::AsyncRead + Unpin>(
         reader: &mut R,
         version: u8,
@@ -315,6 +313,16 @@ impl CasObject {
             return Err(CasObjectError::FormatError(anyhow!("Xorb Info Format Error")));
         }
 
+        Ok(Self { info, info_length })
+    }
+
+    /// Construct CasObject object from AsyncRead.
+    /// assumes that the ident and version have already been read and verified.
+    pub async fn deserialize_async<R: futures::io::AsyncRead + Unpin>(
+        reader: &mut R,
+        version: u8,
+    ) -> Result<Self, CasObjectError> {
+        let (info, info_length) = CasObjectInfo::deserialize_async(reader, version).await?;
         Ok(Self { info, info_length })
     }
 
@@ -686,6 +694,8 @@ pub mod test_utils {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+
+    use futures::TryStreamExt;
 
     use super::test_utils::*;
     use super::*;
@@ -1126,5 +1136,36 @@ mod tests {
 
         assert_eq!(c.info.num_chunks, c2.info.num_chunks);
         assert_eq!(raw_data, c2.get_all_bytes(&mut reader).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_serialization_async_deserialization() {
+        // Arrange
+        let (c, _cas_data, raw_data, raw_chunk_boundaries) =
+            build_cas_object(64, ChunkSize::Random(512, 2048), CompressionScheme::LZ4);
+        let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+        // Act & Assert
+        assert!(CasObject::serialize(
+            &mut buf,
+            &c.info.cashash,
+            &raw_data,
+            &raw_chunk_boundaries,
+            CompressionScheme::LZ4
+        )
+        .is_ok());
+
+        let xorb_bytes = buf.into_inner();
+        // length - 4 byte for the info_length - info_length + ident + version (already read ident + version)
+        let start_pos = xorb_bytes.len() - size_of::<u32>() - c.info_length as usize
+            + size_of::<CasObjectIdent>()
+            + size_of::<u8>();
+
+        let chunks = xorb_bytes[start_pos..].chunks(10).map(|c| Ok(c)).collect::<Vec<_>>();
+        let mut xorb_footer_async_reader = futures::stream::iter(chunks).into_async_read();
+        let cas_object_result =
+            CasObject::deserialize_async(&mut xorb_footer_async_reader, CAS_OBJECT_FORMAT_VERSION).await;
+        assert!(cas_object_result.is_ok(), "{cas_object_result:?}");
+        let cas_object = cas_object_result.unwrap();
+        assert_eq!(c, cas_object);
     }
 }
