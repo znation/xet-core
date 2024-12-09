@@ -9,6 +9,11 @@ use utils::ThreadPool;
 
 use crate::log_buffer::{get_telemetry_task, LogBufferLayer, TELEMETRY_PRE_ALLOC_BYTES};
 
+/// Default log level for the library to use. Override using `RUST_LOG` env variable.
+#[cfg(not(debug_assertions))]
+const DEFAULT_LOG_LEVEL: &str = "warn";
+
+#[cfg(debug_assertions)]
 const DEFAULT_LOG_LEVEL: &str = "info";
 
 pub fn initialize_logging(threadpool: Arc<ThreadPool>) {
