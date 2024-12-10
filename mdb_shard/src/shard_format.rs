@@ -125,7 +125,7 @@ pub struct MDBShardFileFooter {
     pub shard_key_expiry: u64,
 
     // More locations to stick in here if needed.
-    _buffer: [u64; 6],
+    pub _buffer: [u64; 6],
     pub stored_bytes_on_disk: u64,
     pub materialized_bytes: u64,
     pub stored_bytes: u64,
@@ -1241,6 +1241,7 @@ pub mod test_routines {
     use crate::file_structs::{FileDataSequenceEntry, FileDataSequenceHeader, FileMetadataExt, MDBFileInfo};
     use crate::shard_format::MDBShardInfo;
     use crate::shard_in_memory::MDBInMemoryShard;
+    use crate::streaming_shard::MDBMinimalShard;
 
     pub fn simple_hash(n: u64) -> MerkleHash {
         MerkleHash::from([n, 1, 0, 0])
@@ -1431,6 +1432,10 @@ pub mod test_routines {
         // Now, test that the results on queries from the
         let shard_file = MDBShardInfo::load_from_file(&mut cursor)?;
 
+        // Test on the minimal shard format as well
+        cursor.rewind()?;
+        let min_shard = MDBMinimalShard::from_reader(&mut cursor, true, true).unwrap();
+
         let mem_size = mem_shard.shard_file_size();
         let disk_size = shard_file.num_bytes();
 
@@ -1509,6 +1514,7 @@ pub mod test_routines {
 
         // Make sure the cas blocks are correct
         let cas_blocks = shard_file.read_all_cas_blocks(&mut cursor)?;
+        assert_eq!(cas_blocks.len(), min_shard.num_cas());
 
         for (i, (cas_block, pos)) in cas_blocks.into_iter().enumerate() {
             let cas = mem_shard.cas_content.get(&cas_block.cas_hash).unwrap();
@@ -1522,6 +1528,13 @@ pub mod test_routines {
 
             assert_eq!(&read_cas, cas.as_ref());
             assert_eq!(&cas_blocks_full[i], cas.as_ref());
+
+            let m_cas_chunk = min_shard.cas(i);
+            assert_eq!(m_cas_chunk.header(), &cas_blocks_full[i].metadata);
+            assert_eq!(m_cas_chunk.num_entries(), cas_blocks_full[i].chunks.len());
+            for j in 0..m_cas_chunk.num_entries() {
+                assert_eq!(cas_blocks_full[i].chunks[j], m_cas_chunk.chunk(j));
+            }
         }
 
         // Make sure the file info section is good
@@ -1530,9 +1543,12 @@ pub mod test_routines {
             let file_info = MDBShardInfo::read_file_info_ranges(&mut cursor)?;
 
             assert_eq!(file_info.len(), mem_shard.file_content.len());
+            assert_eq!(file_info.len(), min_shard.num_files());
 
-            for (file_hash, data_byte_range, verification_byte_range, _metadata_ext_byte_range) in file_info {
-                let true_fie = mem_shard.file_content.get(&file_hash).unwrap();
+            for (i, (file_hash, data_byte_range, verification_byte_range, _metadata_ext_byte_range)) in
+                file_info.into_iter().enumerate()
+            {
+                let true_fi = mem_shard.file_content.get(&file_hash).unwrap();
 
                 // Check FileDataSequenceEntry
                 let (byte_start, byte_end) = data_byte_range;
@@ -1543,16 +1559,22 @@ pub mod test_routines {
                 // No leftovers
                 assert_eq!(num_entries * (size_of::<FileDataSequenceEntry>() as u64), (byte_end - byte_start));
 
-                assert_eq!(num_entries, true_fie.segments.len() as u64);
+                assert_eq!(num_entries, true_fi.segments.len() as u64);
 
-                for i in 0..true_fie.metadata.num_entries as u64 {
-                    let pos = byte_start + i * (size_of::<FileDataSequenceEntry>() as u64);
+                // Minimal view is good
+                let m_file_info = min_shard.file(i);
+                assert_eq!(m_file_info.header(), &true_fi.metadata);
+                assert_eq!(m_file_info.num_entries(), true_fi.segments.len());
+
+                for j in 0..true_fi.metadata.num_entries as usize {
+                    let pos = byte_start + (j * size_of::<FileDataSequenceEntry>()) as u64;
 
                     cursor.seek(std::io::SeekFrom::Start(pos))?;
 
                     let fie = FileDataSequenceEntry::deserialize(&mut cursor)?;
 
-                    assert_eq!(true_fie.segments[i as usize], fie);
+                    assert_eq!(true_fi.segments[j], fie);
+                    assert_eq!(m_file_info.entry(j), true_fi.segments[j])
                 }
 
                 // Check FileVerificationEntry if exists
@@ -1564,16 +1586,17 @@ pub mod test_routines {
                     // No leftovers
                     assert_eq!(num_entries * (size_of::<FileVerificationEntry>() as u64), (byte_end - byte_start));
 
-                    assert_eq!(num_entries, true_fie.verification.len() as u64);
+                    assert_eq!(num_entries, true_fi.verification.len() as u64);
 
-                    for i in 0..true_fie.metadata.num_entries as u64 {
-                        let pos = byte_start + i * (size_of::<FileVerificationEntry>() as u64);
+                    for j in 0..true_fi.metadata.num_entries as usize {
+                        let pos = byte_start + (j * size_of::<FileVerificationEntry>()) as u64;
 
                         cursor.seek(std::io::SeekFrom::Start(pos))?;
 
                         let fie = FileVerificationEntry::deserialize(&mut cursor)?;
 
-                        assert_eq!(true_fie.verification[i as usize], fie);
+                        assert_eq!(true_fi.verification[j], fie);
+                        assert_eq!(true_fi.verification[j], m_file_info.verification(j));
                     }
                 }
             }
@@ -1625,6 +1648,9 @@ mod tests {
 
     #[test]
     fn test_multiple() -> Result<()> {
+        let shard = gen_random_shard(0, &[1], &[1, 1], false, false)?;
+        verify_mdb_shard(&shard)?;
+
         let shard = gen_random_shard(0, &[1, 5, 10, 8], &[4, 3, 5, 9, 4, 6], false, false)?;
         verify_mdb_shard(&shard)?;
 
