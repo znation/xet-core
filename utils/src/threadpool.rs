@@ -1,8 +1,7 @@
 use std::fmt::Display;
 use std::future::Future;
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// This module provides a simple wrapper around Tokio's runtime to create a thread pool
 /// with some default settings. It is intended to be used as a singleton thread pool for
@@ -52,14 +51,13 @@ use std::time::Duration;
 /// - `new_threadpool`: Creates a new Tokio runtime with the specified settings.
 use tokio;
 use tokio::task::{JoinError, JoinHandle};
-use tracing::debug;
+use tracing::{debug, error};
 use xet_error::Error;
 
 const THREADPOOL_NUM_WORKER_THREADS: usize = 4; // 4 active threads
 const THREADPOOL_THREAD_ID_PREFIX: &str = "hf-xet"; // thread names will be hf-xet-0, hf-xet-1, etc.
 const THREADPOOL_STACK_SIZE: usize = 8_000_000; // 8MB stack size
 const THREADPOOL_MAX_BLOCKING_THREADS: usize = 100; // max 100 threads can block IO
-const RUNTIME_SHUTDOWN_WINDOW_MS: u64 = 5 * 1000; // The runtime shuts down in 5 seconds when Ctrl-C is pressed.
 
 /// Define an error time for spawning external threads.
 #[derive(Debug, Error)]
@@ -71,7 +69,7 @@ pub enum MultithreadedRuntimeError {
     #[error("Task Panic: {0:?}.")]
     TaskPanic(JoinError),
 
-    #[error("Task cancelled; possible runtime shutdown in progress {0}.")]
+    #[error("Task cancelled; possible runtime shutdown in progress ({0}).")]
     TaskCanceled(String),
 
     #[error("Unknown task runtime error: {0}")]
@@ -83,12 +81,16 @@ pub struct ThreadPool {
     // This has to allow for exclusive access to enable shutdown when
     runtime: std::sync::RwLock<Option<tokio::runtime::Runtime>>,
 
-    // We should use this handle when we actually enter the runtime, which means that during shutdown, spawned tasks
-    // and the like are actually
+    // We use this handle when we actually enter the runtime to avoid the lock.  It is
+    // the same as using the runtime, with the exception that it does not block a shutdown
+    // while holding a reference to the runtime does.
     handle: tokio::runtime::Handle,
 
     // The number of external threads calling into this threadpool
     external_executor_count: AtomicUsize,
+
+    // Are we in the middle of a sigint shutdown?
+    sigint_shutdown: AtomicBool,
 }
 
 impl ThreadPool {
@@ -98,6 +100,7 @@ impl ThreadPool {
             handle: runtime.handle().clone(),
             runtime: std::sync::RwLock::new(Some(runtime)),
             external_executor_count: AtomicUsize::new(0),
+            sigint_shutdown: AtomicBool::new(false),
         })
     }
 
@@ -108,22 +111,32 @@ impl ThreadPool {
     }
 
     /// Cancels and shuts down the runtime.  All tasks currently running will be aborted.
-    pub fn cancel_all_and_shutdown(&self) {
-        // Shutdown with a timeout.  This waits up to 5 seconds for all the running tasks to complete or yield at an
-        // await statement, then it drops the worker threads to force shutdown.  This may cause resource
-        // leaks, but this is usually used in the context where the larger process needs to be shut down
-        // anyway and thus that is okay.
+    pub fn perform_sigint_shutdown(&self) {
+        // Shut down the tokio
+        self.sigint_shutdown.store(true, Ordering::SeqCst);
+
+        if cfg!(debug_assertions) {
+            eprintln!("SIGINT detected, shutting down.");
+        }
 
         // When a task is shut down, it will stop running at whichever .await it has yielded at.  All local
         // variables are destroyed by running their destructor.
         let maybe_runtime = self.runtime.write().expect("cancel_all called recursively.").take();
 
         let Some(runtime) = maybe_runtime else {
-            eprintln!("WARNING: cancel_all_and_shutdown called on runtime that has already been shut down.");
+            eprintln!("WARNING: perform_sigint_shutdown called on runtime that has already been shut down.");
             return;
         };
 
-        runtime.shutdown_timeout(Duration::from_millis(RUNTIME_SHUTDOWN_WINDOW_MS));
+        // Dropping the runtime will cancel all the tasks; shutdown occurs when the next async call
+        // is encountered.  Ideally, all async code should be cancelation safe.
+        drop(runtime);
+    }
+
+    /// Returns true if we're in the middle of a sigint shutdown,
+    /// and false otherwise.
+    pub fn in_sigint_shutdown(&self) -> bool {
+        self.sigint_shutdown.load(Ordering::SeqCst)
     }
 
     /// This function should ONLY be used by threads outside of tokio; it should not be called
@@ -136,14 +149,12 @@ impl ThreadPool {
         self.external_executor_count.fetch_add(1, Ordering::SeqCst);
 
         let ret = self.handle.block_on(async move {
-            // Run the actual task on a task worker thread so it can be aborted when
-            // it yields by the shutdown process, or that panics can be reported as errors.
-            // Processes run on this thread, through block_on, will not be shutdown when the runtime is
-            // shut down.
-
+            // Run the actual task on a task worker thread so we can get back information
+            // on issues, including reporting panics as runtime errors.
             tokio::spawn(future).await.map_err(|e| {
                 if e.is_panic() {
                     // The task panic'd.  Pass this exception on.
+                    error!("Panic reported on xet worker task: {e:?}");
                     MultithreadedRuntimeError::TaskPanic(e)
                 } else if e.is_cancelled() {
                     // Likely caused by the runtime shutting down (e.g. with a keyboard CTRL-C).
