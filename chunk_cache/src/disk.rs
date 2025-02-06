@@ -264,7 +264,9 @@ impl DiskCache {
                 }
             }
 
-            let Ok(header) = CacheFileHeader::deserialize(&mut file)
+            let mut file_reader = std::io::BufReader::new(file);
+
+            let Ok(header) = CacheFileHeader::deserialize(&mut file_reader)
                 .debug_error(format!("failed to deserialize cache file header on path: {path:?}"))
             else {
                 self.remove_item(key, &cache_item)?;
@@ -272,7 +274,7 @@ impl DiskCache {
             };
 
             let start = cache_item.range.start;
-            let result_buf = get_range_from_cache_file(&header, &mut file, range, start)?;
+            let result_buf = get_range_from_cache_file(&header, &mut file_reader, range, start)?;
             return Ok(Some(result_buf));
         }
     }
