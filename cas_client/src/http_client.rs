@@ -2,16 +2,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::anyhow;
-use error_printer::OptionPrinter;
+use cas_types::REQUEST_ID_HEADER;
+use error_printer::{ErrorPrinter, OptionPrinter};
 use reqwest::header::{HeaderValue, AUTHORIZATION};
 use reqwest::{Request, Response};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, Middleware, Next};
 use reqwest_retry::policies::ExponentialBackoff;
 use reqwest_retry::{default_on_request_failure, default_on_request_success, RetryTransientMiddleware, Retryable};
-use tracing::warn;
+use tracing::{debug, warn};
 use utils::auth::{AuthConfig, TokenProvider};
 
-use crate::CasClientError;
+use crate::{error, CasClientError};
 
 const NUM_RETRIES: u32 = 5;
 const BASE_RETRY_DELAY_MS: u64 = 3000; // 3s
@@ -114,20 +115,24 @@ impl Middleware for LoggingMiddleware {
         extensions: &mut http::Extensions,
         next: Next<'_>,
     ) -> reqwest_middleware::Result<Response> {
-        let res = next.run(req, extensions).await;
-        if res.is_ok() {
-            let res = res.as_ref().unwrap();
-            if Some(Retryable::Transient) == default_on_request_success(res) {
-                let status_code = res.status();
-                warn!("Status Code: {status_code:?}. Retrying...");
-            }
-        } else {
-            let err = res.as_ref().unwrap_err();
-            if Some(Retryable::Transient) == default_on_request_failure(err) {
-                warn!("{err:?}. Retrying...");
-            }
-        }
-        res
+        next.run(req, extensions)
+            .await
+            .inspect(|res| {
+                // Response received, debug log it and use the status code
+                // to check if we are retrying or not.
+                let status_code = res.status().as_u16();
+                let request_id = request_id_from_response(res);
+                debug!(request_id, status_code, "Received CAS response");
+                if Some(Retryable::Transient) == default_on_request_success(res) {
+                    warn!(request_id, "Status Code: {status_code:?}. Retrying...");
+                }
+            })
+            .inspect_err(|err| {
+                // Error received, check if we are retrying or not.
+                if Some(Retryable::Transient) == default_on_request_failure(err) {
+                    warn!("{err:?}. Retrying...");
+                }
+            })
     }
 }
 
@@ -175,6 +180,35 @@ impl Middleware for AuthMiddleware {
         headers.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", token)).unwrap());
         next.run(req, extensions).await
     }
+}
+
+/// Helper trait to log the different types of errors that come back from a request to CAS,
+/// transforming the implementation into some new error type.
+pub trait ResponseErrorLogger<T> {
+    fn process_error(self, api: &str) -> T;
+}
+
+/// Add ResponseErrorLogger to Result<Response> for our requests.
+/// This logs an error if one occurred before receiving a response or
+/// if the status code indicates a failure.
+/// As a result of these checks, the response is also transformed into a
+/// cas_client::error::Result instead of the raw reqwest_middleware::Result.
+impl ResponseErrorLogger<error::Result<Response>> for reqwest_middleware::Result<Response> {
+    fn process_error(self, api: &str) -> error::Result<Response> {
+        let res = self.log_error(format!("error invoking {api} api"))?;
+        let request_id = request_id_from_response(&res);
+        let error_message = format!("{api} api failed: request id: {request_id}");
+        Ok(res.error_for_status().log_error(error_message)?)
+    }
+}
+
+pub fn request_id_from_response(res: &Response) -> &str {
+    let request_id = res
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+    request_id
 }
 
 #[cfg(test)]
@@ -264,6 +298,6 @@ mod tests {
         assert!(logs_contain("Status Code: 500. Retrying..."));
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(3, mock.hits());
-        assert_eq!(start_time.elapsed().unwrap() > Duration::from_secs(0), true);
+        assert!(start_time.elapsed().unwrap() > Duration::from_secs(0));
     }
 }
