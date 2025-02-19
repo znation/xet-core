@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufReader, Cursor, Read, Seek, Write};
+use std::io::{BufReader, Cursor, ErrorKind, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
@@ -232,9 +232,30 @@ impl MDBShardFile {
         Ok(BufReader::with_capacity(2048, std::fs::File::open(&self.path)?))
     }
 
+    // Helper function to swallow io::ErrorKind::NotFound errors. In the case of
+    // a cached shard was registered but later deleted during the lifetime
+    // of a shard file manager, queries to this shard should not fail hard.
+    pub fn get_reader_if_present(&self) -> Result<Option<BufReader<std::fs::File>>> {
+        match self.get_reader() {
+            Ok(v) => Ok(Some(v)),
+            Err(MDBShardError::IOError(e)) => {
+                if e.kind() == ErrorKind::NotFound {
+                    Ok(None)
+                } else {
+                    Err(MDBShardError::IOError(e))
+                }
+            },
+            Err(other_err) => Err(other_err),
+        }
+    }
+
     #[inline]
     pub fn get_file_reconstruction_info(&self, file_hash: &MerkleHash) -> Result<Option<MDBFileInfo>> {
-        self.shard.get_file_reconstruction_info(&mut self.get_reader()?, file_hash)
+        let Some(mut reader) = self.get_reader_if_present()? else {
+            return Ok(None);
+        };
+
+        self.shard.get_file_reconstruction_info(&mut reader, file_hash)
     }
 
     #[inline]
@@ -242,7 +263,11 @@ impl MDBShardFile {
         &self,
         query_hashes: &[MerkleHash],
     ) -> Result<Option<(usize, FileDataSequenceEntry)>> {
-        self.shard.chunk_hash_dedup_query(&mut self.get_reader()?, query_hashes)
+        let Some(mut reader) = self.get_reader_if_present()? else {
+            return Ok(None);
+        };
+
+        self.shard.chunk_hash_dedup_query(&mut reader, query_hashes)
     }
 
     #[inline]
@@ -252,12 +277,12 @@ impl MDBShardFile {
         cas_block_index: u32,
         cas_chunk_offset: u32,
     ) -> Result<Option<(usize, FileDataSequenceEntry)>> {
-        self.shard.chunk_hash_dedup_query_direct(
-            &mut self.get_reader()?,
-            query_hashes,
-            cas_block_index,
-            cas_chunk_offset,
-        )
+        let Some(mut reader) = self.get_reader_if_present()? else {
+            return Ok(None);
+        };
+
+        self.shard
+            .chunk_hash_dedup_query_direct(&mut reader, query_hashes, cas_block_index, cas_chunk_offset)
     }
 
     #[inline]
