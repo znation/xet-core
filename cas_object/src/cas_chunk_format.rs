@@ -76,7 +76,8 @@ impl CASChunkHeader {
                 self.get_compressed_length()
             )));
         }
-        if self.get_compressed_length() as usize > MAXIMUM_CHUNK_SIZE * 2 {
+        // the max chunk size is strictly enforced
+        if self.get_uncompressed_length() as usize > MAXIMUM_CHUNK_SIZE {
             return Err(CasObjectError::FormatError(anyhow!(
                 "chunk header uncompressed length too large at {}, maximum: {MAXIMUM_CHUNK_SIZE}",
                 self.get_uncompressed_length()
@@ -214,8 +215,8 @@ mod tests {
 
     use super::*;
 
-    const COMP_LEN: u32 = 0x010203;
-    const UNCOMP_LEN: u32 = 0x040506;
+    const COMP_LEN: u32 = 66051;
+    const UNCOMP_LEN: u32 = 131072;
 
     fn assert_chunk_header_deserialize_match(header: &CASChunkHeader, buf: &[u8]) {
         assert_eq!(buf[0], header.version);
