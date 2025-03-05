@@ -1,10 +1,10 @@
 use std::env::current_dir;
-use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::num::NonZero;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::{env, fs};
 
 use cas_client::CacheConfig;
 use cas_object::CompressionScheme;
@@ -38,9 +38,18 @@ pub fn default_config(
     token_info: Option<(String, u64)>,
     token_refresher: Option<Arc<dyn TokenRefresher>>,
 ) -> errors::Result<(TranslatorConfig, TempDir)> {
-    let home = home_dir().unwrap_or(current_dir()?);
-
-    let cache_root_path = home.join(".cache").join("huggingface").join("xet");
+    // if HF_HOME is set use that instead of ~/.cache/huggingface
+    // if HF_XET_CACHE is set use that instead of ~/.cache/huggingface/xet
+    // HF_XET_CACHE takes precedence over HF_HOME
+    let cache_root_path = if env::var("HF_XET_CACHE").is_ok() {
+        PathBuf::from(env::var("HF_XET_CACHE").unwrap())
+    } else if env::var("HF_HOME").is_ok() {
+        let home = env::var("HF_HOME").unwrap();
+        PathBuf::from(home).join("xet")
+    } else {
+        let home = home_dir().unwrap_or(current_dir()?);
+        home.join(".cache").join("huggingface").join("xet")
+    };
 
     let staging_root = cache_root_path.join("staging");
     std::fs::create_dir_all(&staging_root)?;
@@ -217,4 +226,124 @@ async fn smudge_file(
         .smudge_file_from_pointer(pointer_file, &mut f, None, progress_updater)
         .await?;
     Ok(pointer_file.path().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+
+    use serial_test::serial;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    #[serial(default_config_env)]
+    fn test_default_config_with_hf_home() {
+        let temp_dir = tempdir().unwrap();
+        env::set_var("HF_HOME", temp_dir.path().to_str().unwrap());
+
+        let endpoint = "http://localhost:8080".to_string();
+        let result = default_config(endpoint, None, None, None);
+
+        assert!(result.is_ok());
+        let (config, _tempdir) = result.unwrap();
+        assert!(config.cas_storage_config.cache_config.is_some());
+        assert!(config
+            .cas_storage_config
+            .cache_config
+            .unwrap()
+            .cache_directory
+            .starts_with(&temp_dir.path()));
+
+        env::remove_var("HF_HOME");
+    }
+
+    #[test]
+    #[serial(default_config_env)]
+    fn test_default_config_with_hf_xet_cache_and_hf_home() {
+        let temp_dir_xet_cache = tempdir().unwrap();
+        let temp_dir_hf_home = tempdir().unwrap();
+        env::set_var("HF_XET_CACHE", temp_dir_xet_cache.path().to_str().unwrap());
+        env::set_var("HF_HOME", temp_dir_hf_home.path().to_str().unwrap());
+
+        let endpoint = "http://localhost:8080".to_string();
+        let result = default_config(endpoint, None, None, None);
+
+        assert!(result.is_ok());
+        let (config, _tempdir) = result.unwrap();
+        assert!(config.cas_storage_config.cache_config.is_some());
+        assert!(config
+            .cas_storage_config
+            .cache_config
+            .unwrap()
+            .cache_directory
+            .starts_with(&temp_dir_xet_cache.path()));
+
+        env::remove_var("HF_XET_CACHE");
+        env::remove_var("HF_HOME");
+
+        let temp_dir = tempdir().unwrap();
+        env::set_var("HF_HOME", temp_dir.path().to_str().unwrap());
+
+        let endpoint = "http://localhost:8080".to_string();
+        let result = default_config(endpoint, None, None, None);
+
+        assert!(result.is_ok());
+        let (config, _tempdir) = result.unwrap();
+        assert!(config.cas_storage_config.cache_config.is_some());
+        assert!(config
+            .cas_storage_config
+            .cache_config
+            .unwrap()
+            .cache_directory
+            .starts_with(&temp_dir.path()));
+
+        env::remove_var("HF_HOME");
+    }
+
+    #[test]
+    #[serial(default_config_env)]
+    fn test_default_config_with_hf_xet_cache() {
+        let temp_dir = tempdir().unwrap();
+        env::set_var("HF_XET_CACHE", temp_dir.path().to_str().unwrap());
+
+        let endpoint = "http://localhost:8080".to_string();
+        let result = default_config(endpoint, None, None, None);
+
+        assert!(result.is_ok());
+        let (config, _tempdir) = result.unwrap();
+        assert!(config.cas_storage_config.cache_config.is_some());
+        assert!(config
+            .cas_storage_config
+            .cache_config
+            .unwrap()
+            .cache_directory
+            .starts_with(&temp_dir.path()));
+
+        env::remove_var("HF_XET_CACHE");
+    }
+
+    #[test]
+    #[serial(default_config_env)]
+    fn test_default_config_without_env_vars() {
+        let endpoint = "http://localhost:8080".to_string();
+        let result = default_config(endpoint, None, None, None);
+
+        let expected = home_dir()
+            .unwrap_or(std::env::current_dir().unwrap())
+            .join(".cache")
+            .join("huggingface")
+            .join("xet");
+
+        assert!(result.is_ok());
+        let (config, _tempdir) = result.unwrap();
+        assert!(config.cas_storage_config.cache_config.is_some());
+        assert!(config
+            .cas_storage_config
+            .cache_config
+            .unwrap()
+            .cache_directory
+            .starts_with(&expected));
+    }
 }
