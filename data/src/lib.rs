@@ -1,21 +1,19 @@
 #![allow(dead_code)]
-
-mod chunking;
 pub mod configurations;
 mod constants;
-mod data_aggregator;
 pub mod data_client;
+mod deduplication_interface;
 pub mod errors;
 mod file_cleaner;
 mod file_downloader;
 mod file_upload_session;
-mod metrics;
 pub mod migration_tool;
 mod parallel_xorb_uploader;
 mod pointer_file;
+mod prometheus_metrics;
 mod remote_client_interface;
-mod remote_shard_interface;
 mod repo_salt;
+mod sha256;
 mod shard_interface;
 
 pub use cas_client::CacheConfig;

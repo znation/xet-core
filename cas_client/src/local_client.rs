@@ -89,7 +89,8 @@ impl LocalClient {
         // Open / setup the shard lookup
         let shard_directory_ = shard_dir.clone();
         let shard_manager = tokio::task::block_in_place(|| {
-            Handle::current().block_on(async move { ShardFileManager::new(shard_directory_).await })
+            Handle::current()
+                .block_on(async move { ShardFileManager::new_in_session_directory(shard_directory_).await })
         })?;
 
         Ok(Self {
@@ -400,7 +401,7 @@ impl ReconstructionClient for LocalClient {
         byte_range: Option<FileRange>,
         writer: &mut Box<dyn Write + Send>,
         _progress_updater: Option<Arc<dyn ProgressUpdater>>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let Some((file_info, _)) = self
             .shard_manager
             .get_file_reconstruction_info(hash)
@@ -429,7 +430,7 @@ impl ReconstructionClient for LocalClient {
 
         writer.write_all(&file_vec[start..end])?;
 
-        Ok(())
+        Ok((end - start) as u64)
     }
 }
 

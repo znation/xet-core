@@ -10,7 +10,7 @@ use xet_threadpool::ThreadPool;
 use crate::configurations::TranslatorConfig;
 use crate::errors::*;
 use crate::remote_client_interface::create_remote_client;
-use crate::PointerFile;
+use crate::{prometheus_metrics, PointerFile};
 
 /// Manages the download of files based on a hash or pointer file.
 ///
@@ -19,13 +19,13 @@ use crate::PointerFile;
 /// and xorbs needed to reconstruct those files are properly uploaded and registered.
 pub struct FileDownloader {
     /* ----- Configurations ----- */
-    config: TranslatorConfig,
+    config: Arc<TranslatorConfig>,
     client: Arc<dyn Client + Send + Sync>,
 }
 
 /// Smudge operations
 impl FileDownloader {
-    pub async fn new(config: TranslatorConfig, threadpool: Arc<ThreadPool>) -> Result<Self> {
+    pub async fn new(config: Arc<TranslatorConfig>, threadpool: Arc<ThreadPool>) -> Result<Self> {
         let client = create_remote_client(&config, threadpool.clone(), false)?;
 
         Ok(Self { config, client })
@@ -37,7 +37,7 @@ impl FileDownloader {
         writer: &mut Box<dyn Write + Send>,
         range: Option<FileRange>,
         progress_updater: Option<Arc<dyn ProgressUpdater>>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         self.smudge_file_from_hash(&pointer.hash()?, writer, range, progress_updater)
             .await
     }
@@ -48,9 +48,12 @@ impl FileDownloader {
         writer: &mut Box<dyn Write + Send>,
         range: Option<FileRange>,
         progress_updater: Option<Arc<dyn ProgressUpdater>>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         // Currently, this works by always directly querying the remote server.
-        self.client.get_file(file_id, range, writer, progress_updater).await?;
-        Ok(())
+        let n_bytes = self.client.get_file(file_id, range, writer, progress_updater).await?;
+
+        prometheus_metrics::FILTER_BYTES_SMUDGED.inc_by(n_bytes);
+
+        Ok(n_bytes)
     }
 }
