@@ -1,6 +1,8 @@
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::io::{Cursor, Write};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,6 +16,7 @@ use cas_types::{
 use chunk_cache::{CacheConfig, ChunkCache};
 use error_printer::ErrorPrinter;
 use file_utils::SafeFileCreator;
+use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
 use http::header::RANGE;
 use mdb_shard::file_structs::{FileDataSequenceEntry, FileDataSequenceHeader, MDBFileInfo};
@@ -22,6 +25,7 @@ use mdb_shard::utils::shard_file_name;
 use merklehash::{HashedWrite, MerkleHash};
 use reqwest::{StatusCode, Url};
 use reqwest_middleware::ClientWithMiddleware;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, trace};
 use utils::auth::AuthConfig;
 use utils::progress::ProgressUpdater;
@@ -41,7 +45,13 @@ pub const PREFIX_DEFAULT: &str = "default";
 
 const NUM_RETRIES: usize = 5;
 const BASE_RETRY_DELAY_MS: u64 = 3000;
-const NUM_CONCURRENT_RANGE_GETS: usize = 8;
+const NUM_CONCURRENT_RANGE_GETS: usize = 16;
+
+/// Env to switch to writing terms sequentially to disk. Benchmarks have shown that on
+/// SSD machines, writing in parallel seems to far outperform sequential term writes.
+/// However, this is not likely the case for writing to HDD and may in fact be worse,
+/// so for those machines, setting this env may help download perf.
+const ENV_RECONSTRUCT_WRITE_SEQUENTIALLY: &str = "HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY";
 
 type RangeDownloadSingleFlight = Arc<Group<(Vec<u8>, Vec<u32>), CasClientError>>;
 
@@ -142,26 +152,40 @@ impl ReconstructionClient for RemoteClient {
         &self,
         hash: &MerkleHash,
         byte_range: Option<FileRange>,
-        writer: &mut Box<dyn Write + Send>,
+        output_provider: &OutputProvider,
         progress_updater: Option<Arc<dyn ProgressUpdater>>,
     ) -> Result<u64> {
         // get manifest of xorbs to download, api call to CAS
         let manifest = self.get_reconstruction(hash, byte_range.clone()).await?;
-
         let terms = manifest.terms;
         let fetch_info = Arc::new(manifest.fetch_info);
-        self.reconstruct_file_to_writer(
-            terms,
-            fetch_info,
-            manifest.offset_into_first_range,
-            byte_range,
-            writer,
-            progress_updater,
-        )
-        .await
+
+        // If the user has set the `ENV_RECONSTRUCT_WRITE_SEQUENTIALLY` env variable, then we should
+        // write the file to the output sequentially instead of in parallel.
+        if env::var(ENV_RECONSTRUCT_WRITE_SEQUENTIALLY).is_ok() {
+            self.reconstruct_file_to_writer(
+                terms,
+                fetch_info,
+                manifest.offset_into_first_range,
+                byte_range,
+                output_provider,
+                progress_updater,
+            )
+            .await
+        } else {
+            self.reconstruct_file_to_writer_parallel(
+                terms,
+                fetch_info,
+                manifest.offset_into_first_range,
+                byte_range,
+                output_provider,
+                progress_updater,
+            )
+            .await
+        }
     }
 
-    async fn batch_get_file(&self, mut files: HashMap<MerkleHash, &mut Box<dyn Write + Send>>) -> Result<u64> {
+    async fn batch_get_file(&self, files: HashMap<MerkleHash, &OutputProvider>) -> Result<u64> {
         let requested_file_ids = files.keys().cloned().collect::<HashSet<_>>();
         let manifest = self.batch_get_reconstruction(requested_file_ids.iter()).await?;
         let fetch_info = Arc::new(manifest.fetch_info);
@@ -176,10 +200,14 @@ impl ReconstructionClient for RemoteClient {
         // TODO: spawn threads to reconstruct each file
         let mut ret_size = 0;
         for (hash, terms) in manifest.files {
-            let w = files.get_mut(&(hash.into())).unwrap();
-            ret_size += self
-                .reconstruct_file_to_writer(terms, fetch_info.clone(), 0, None, w, None)
-                .await?;
+            let w = files.get(&(hash.into())).unwrap();
+            ret_size += if env::var(ENV_RECONSTRUCT_WRITE_SEQUENTIALLY).is_ok() {
+                self.reconstruct_file_to_writer(terms, fetch_info.clone(), 0, None, w, None)
+                    .await?
+            } else {
+                self.reconstruct_file_to_writer_parallel(terms, fetch_info.clone(), 0, None, w, None)
+                    .await?
+            }
         }
 
         Ok(ret_size)
@@ -300,7 +328,7 @@ impl RemoteClient {
         fetch_info: Arc<HashMap<HexMerkleHash, Vec<CASReconstructionFetchInfo>>>,
         offset_into_first_range: u64,
         byte_range: Option<FileRange>,
-        writer: &mut Box<dyn Write + Send>,
+        writer: &OutputProvider,
         progress_updater: Option<Arc<dyn ProgressUpdater>>,
     ) -> Result<u64> {
         let total_len = if let Some(range) = byte_range {
@@ -308,6 +336,7 @@ impl RemoteClient {
         } else {
             terms.iter().fold(0, |acc, x| acc + x.unpacked_length as u64)
         };
+        let mut writer = writer.get_writer_at(0)?;
 
         let futs_iter = terms.into_iter().map(|term| {
             get_one_term(
@@ -340,6 +369,120 @@ impl RemoteClient {
         writer.flush()?;
 
         Ok(total_len)
+    }
+
+    /// Uses the reconstruction response and optionally requested FileRange to re-create a file,
+    /// outputting the file content via indicated OutputProvider.
+    ///
+    /// Unlike `reconstruct_file_to_writer`, this function will spawn a task for writing each
+    /// term to the output, with each task writing to its part of the file.
+    pub async fn reconstruct_file_to_writer_parallel(
+        &self,
+        terms: Vec<CASReconstructionTerm>,
+        fetch_info: Arc<HashMap<HexMerkleHash, Vec<CASReconstructionFetchInfo>>>,
+        offset_into_first_range: u64,
+        byte_range: Option<FileRange>,
+        output_provider: &OutputProvider,
+        progress_updater: Option<Arc<dyn ProgressUpdater>>,
+    ) -> Result<u64> {
+        let total_len = if let Some(range) = byte_range {
+            range.end - range.start
+        } else {
+            terms.iter().fold(0, |acc, x| acc + x.unpacked_length as u64)
+        };
+        let task_info = TermWriteTask {
+            http_client: self.http_client.clone(),
+            chunk_cache: self.chunk_cache.clone(),
+            range_download_single_flight: self.range_download_single_flight.clone(),
+            fetch_info,
+            semaphore: Arc::new(Semaphore::new(NUM_CONCURRENT_RANGE_GETS)),
+            output: output_provider.clone(),
+        };
+        // Build term tasks, computing the offsets needed for the downloaded term and
+        // offset for the output.
+        let mut bytes_written = 0;
+        let mut remaining = total_len;
+        let term_tasks = terms.into_iter().enumerate().map(|(idx, term)| {
+            let start = if idx == 0 { offset_into_first_range as usize } else { 0 };
+            let end = min(start as u64 + remaining, term.unpacked_length as u64) as usize;
+            let file_offset = bytes_written;
+            let len = (end - start) as u64;
+
+            bytes_written += len;
+            remaining -= len;
+
+            let task = task_info.clone();
+            task.write_term(term, start..end, file_offset)
+        });
+
+        // Spawn the tasks
+        let mut handles = FuturesUnordered::new();
+        term_tasks.for_each(|task| {
+            let handle = self.threadpool.spawn(task);
+            handles.push(handle);
+        });
+
+        // Join the tasks as they come in.
+        let mut total_written = 0;
+        while let Some(result) = handles.next().await {
+            match result {
+                Ok(Ok(len_written)) => {
+                    progress_updater.as_ref().inspect(|updater| updater.update(len_written));
+                    total_written += len_written;
+                },
+                Ok(Err(e)) => Err(e)?,
+                Err(e) => Err(CasClientError::Other(format!("Error joining download task {e:?}")))?,
+            }
+        }
+        Ok(total_written)
+    }
+}
+
+/// Helper object containing the structs needed when downloading and writing a term during
+/// reconstruction. Can be cheaply cloned so that the write_term function can be spawned for
+/// each term.
+#[derive(Clone)]
+struct TermWriteTask {
+    http_client: Arc<ClientWithMiddleware>,
+    chunk_cache: Option<Arc<dyn ChunkCache>>,
+    range_download_single_flight: RangeDownloadSingleFlight,
+    fetch_info: Arc<HashMap<HexMerkleHash, Vec<CASReconstructionFetchInfo>>>,
+    semaphore: Arc<Semaphore>,
+    output: OutputProvider,
+}
+
+impl TermWriteTask {
+    /// Download the term and write it to the underlying storage.
+    async fn write_term(self, term: CASReconstructionTerm, term_range: Range<usize>, file_offset: u64) -> Result<u64> {
+        // acquire permit from the semaphore limiting the download parallelism.
+        let _permit = self
+            .semaphore
+            .acquire_owned()
+            .await
+            .log_error("Couldn't download term")
+            .map_err(|_| CasClientError::Other("couldn't acquire semaphore".to_string()))?;
+
+        // download the term
+        let term_data =
+            get_one_term(self.http_client, self.chunk_cache, term, self.fetch_info, self.range_download_single_flight)
+                .await
+                .log_error("error fetching 1 term")?;
+
+        if term_range.end > term_data.len() {
+            error!(
+                "Error: expected term range: {} larger than received term length: {}",
+                term_range.end,
+                term_data.len()
+            );
+            return Err(CasClientError::Other("term range received invalid".to_string()));
+        }
+        let len = (term_range.end - term_range.start) as u64;
+
+        // write the term
+        let mut writer = self.output.get_writer_at(file_offset)?;
+        writer.write_all(&term_data[term_range])?;
+        writer.flush()?;
+        Ok(len)
     }
 }
 
@@ -612,38 +755,13 @@ impl ShardClientInterface for RemoteClient {}
 
 #[cfg(test)]
 mod tests {
-
-    #[derive(Debug, Default, Clone)]
-    /// Thread-safe in-memory buffer that implements [Write](std::io::Write) trait and allows
-    /// access to inner buffer
-    pub struct ThreadSafeBuffer {
-        inner: Arc<Mutex<Cursor<Vec<u8>>>>,
-    }
-
-    impl ThreadSafeBuffer {
-        pub fn value(&self) -> Vec<u8> {
-            self.inner.lock().unwrap().get_ref().clone()
-        }
-    }
-
-    impl Write for ThreadSafeBuffer {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.inner.lock().map_err(|e| std::io::Error::other(format!("{e}")))?.write(buf)
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    use std::sync::Mutex;
-
     use cas_object::test_utils::{build_cas_object, ChunkSize};
     use cas_types::ChunkRange;
     use chunk_cache::MockChunkCache;
     use tracing_test::traced_test;
 
     use super::*;
+    use crate::interface::buffer::BufferProvider;
 
     // test reconstruction contains 20 chunks, where each chunk size is 10 bytes
     const TEST_CHUNK_RANGE: ChunkRange = ChunkRange {
@@ -660,8 +778,7 @@ mod tests {
     fn test_basic_put() {
         // Arrange
         let prefix = PREFIX_DEFAULT;
-        let (c, _, data, chunk_boundaries) =
-            build_cas_object(3, ChunkSize::Random(512, 10248), cas_object::CompressionScheme::LZ4);
+        let (c, _, data, chunk_boundaries) = build_cas_object(3, ChunkSize::Random(512, 10248), CompressionScheme::LZ4);
 
         let threadpool = Arc::new(ThreadPool::new().unwrap());
         let client = RemoteClient::new(
@@ -684,6 +801,7 @@ mod tests {
 
     #[test]
     fn test_reconstruct_file_to_writer() {
+        #[derive(Clone)]
         struct TestCase {
             reconstruction_response: QueryReconstructionResponse,
             range: Option<FileRange>,
@@ -765,6 +883,8 @@ mod tests {
             },
         ];
         for test in test_cases {
+            let test1 = test.clone();
+            // test writing to file term-by-term
             let mut chunk_cache = MockChunkCache::new();
             chunk_cache
                 .expect_get()
@@ -785,18 +905,61 @@ mod tests {
                 shard_cache_directory: "".into(),
             };
 
-            let v = ThreadSafeBuffer::default();
-            let mut writer: Box<dyn Write + Send> = Box::new(v.clone());
-
+            let provider = BufferProvider::default();
+            let buf = provider.buf.clone();
+            let writer = OutputProvider::Buffer(provider);
             let resp = threadpool
                 .external_run_async_task(async move {
                     client
                         .reconstruct_file_to_writer(
+                            test1.reconstruction_response.terms,
+                            Arc::new(test1.reconstruction_response.fetch_info),
+                            test1.reconstruction_response.offset_into_first_range,
+                            test1.range,
+                            &writer,
+                            None,
+                        )
+                        .await
+                })
+                .unwrap();
+            assert_eq!(test1.expect_error, resp.is_err());
+            if !test1.expect_error {
+                assert_eq!(test1.expected_len, resp.unwrap());
+                assert_eq!(vec![1; test1.expected_len as usize], buf.value());
+            }
+
+            // test writing terms to file in parallel
+            let mut chunk_cache = MockChunkCache::new();
+            chunk_cache
+                .expect_get()
+                .returning(|_, range| Ok(Some(vec![1; (range.end - range.start) as usize * TEST_CHUNK_SIZE])));
+
+            let http_client = Arc::new(http_client::build_http_client(&None).unwrap());
+
+            let threadpool = Arc::new(ThreadPool::new().unwrap());
+            let client = RemoteClient {
+                chunk_cache: Some(Arc::new(chunk_cache)),
+                authenticated_http_client: http_client.clone(),
+                http_client,
+                endpoint: "".to_string(),
+                compression: Some(CompressionScheme::LZ4),
+                dry_run: false,
+                threadpool: threadpool.clone(),
+                range_download_single_flight: Arc::new(Group::new()),
+                shard_cache_directory: "".into(),
+            };
+            let provider = BufferProvider::default();
+            let buf = provider.buf.clone();
+            let writer = OutputProvider::Buffer(provider);
+            let resp = threadpool
+                .external_run_async_task(async move {
+                    client
+                        .reconstruct_file_to_writer_parallel(
                             test.reconstruction_response.terms,
                             Arc::new(test.reconstruction_response.fetch_info),
                             test.reconstruction_response.offset_into_first_range,
                             test.range,
-                            &mut writer,
+                            &writer,
                             None,
                         )
                         .await
@@ -806,7 +969,7 @@ mod tests {
             assert_eq!(test.expect_error, resp.is_err());
             if !test.expect_error {
                 assert_eq!(test.expected_len, resp.unwrap());
-                assert_eq!(vec![1; test.expected_len as usize], v.value());
+                assert_eq!(vec![1; test.expected_len as usize], buf.value());
             }
         }
     }
