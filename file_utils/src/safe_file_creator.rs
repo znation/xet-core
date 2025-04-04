@@ -59,7 +59,7 @@ impl SafeFileCreator {
     /// and additionally the metadata of the old one will match the new metadata.
     pub fn replace_existing<P: AsRef<Path>>(dest_path: P) -> io::Result<Self> {
         let mut s = Self::new(&dest_path)?;
-        s.original_metadata = std::fs::metadata(dest_path).ok();
+        s.original_metadata = fs::metadata(dest_path).ok();
         Ok(s)
     }
 
@@ -67,9 +67,9 @@ impl SafeFileCreator {
     fn temp_file_path(dest_path: Option<&Path>) -> io::Result<PathBuf> {
         let (parent, file_name) = match dest_path {
             Some(p) => {
-                let parent = (p.parent().ok_or_else(|| {
+                let parent = p.parent().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "path doesn't have a valid parent directory")
-                }))?;
+                })?;
                 let file_name = p.file_name().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "path doesn't have a valid file name")
                 })?;
@@ -125,7 +125,7 @@ impl SafeFileCreator {
     fn writer(&mut self) -> io::Result<&mut BufWriter<File>> {
         match &mut self.writer {
             Some(wr) => Ok(wr),
-            None => Err(std::io::Error::new(
+            None => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 format!("Writing to {:?} already completed.", &self.dest_path),
             )),
@@ -160,7 +160,7 @@ pub fn write_all_safe(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
         // Make sure dir exists.
         if !dir.exists() {
-            std::fs::create_dir_all(dir)?;
+            fs::create_dir_all(dir)?;
         }
 
         let mut tempfile = create_temp_file(dir, "")?;
@@ -184,6 +184,7 @@ pub fn create_temp_file(dir: &Path, suffix: &str) -> io::Result<NamedTempFile> {
 mod tests {
     use std::fs::{self, File};
     use std::io::Read;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use tempfile::tempdir;
@@ -207,6 +208,7 @@ mod tests {
         // Verify file permissions
         let metadata = fs::metadata(&dest_path).unwrap();
         let permissions = metadata.permissions();
+        #[cfg(unix)]
         assert_eq!(permissions.mode() & 0o777, 0o644); // Assuming default creation mode
     }
 
@@ -232,6 +234,7 @@ mod tests {
         // Verify file permissions
         let metadata = fs::metadata(&dest_path).unwrap();
         let permissions = metadata.permissions();
+        #[cfg(unix)]
         assert_eq!(permissions.mode() & 0o777, 0o644); // Assuming default creation mode
     }
 
@@ -245,6 +248,7 @@ mod tests {
             let mut file = File::create(&dest_path).unwrap();
             file.write_all(b"Old content").unwrap();
             let mut perms = file.metadata().unwrap().permissions();
+            #[cfg(unix)]
             perms.set_mode(0o600);
             fs::set_permissions(&dest_path, perms).unwrap();
         }
@@ -261,6 +265,7 @@ mod tests {
         // Verify file permissions
         let metadata = fs::metadata(&dest_path).unwrap();
         let permissions = metadata.permissions();
+        #[cfg(unix)]
         assert_eq!(permissions.mode() & 0o777, 0o600); // Original file mode
     }
 
@@ -324,6 +329,7 @@ mod tests {
         // Verify file permissions
         let metadata = fs::metadata(&dest_path).unwrap();
         let permissions = metadata.permissions();
+        #[cfg(unix)]
         assert_eq!(permissions.mode() & 0o777, 0o600); // Original file mode
     }
 }
