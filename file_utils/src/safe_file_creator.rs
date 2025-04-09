@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
-use tempfile::NamedTempFile;
 
 use crate::create_file;
 use crate::file_metadata::set_file_metadata;
@@ -21,7 +20,16 @@ impl SafeFileCreator {
     /// and a temporary file is created then renamed on close.
     pub fn new<P: AsRef<Path>>(dest_path: P) -> io::Result<Self> {
         let dest_path = dest_path.as_ref().to_path_buf();
-        let temp_path = Self::temp_file_path(Some(&dest_path))?;
+
+        let parent = dest_path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path doesn't have a valid parent directory"))?;
+        let file_name = parent
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path doesn't have a valid file name"))?
+            .to_str();
+
+        let temp_path = Self::temp_file_path(parent, file_name);
 
         // This matches the permissions and ownership of the parent directory
         let file = create_file(&temp_path)?;
@@ -40,8 +48,8 @@ impl SafeFileCreator {
     /// pub fn set_dest_path<P: AsRef<Path>>(dest_path: P)
     /// ```
     /// to set the destination before closing the file.
-    pub fn new_unnamed() -> io::Result<Self> {
-        let temp_path = Self::temp_file_path(None)?;
+    pub fn new_unnamed(temp_root: impl AsRef<Path>) -> io::Result<Self> {
+        let temp_path = Self::temp_file_path(temp_root, None);
 
         // This matches the permissions and ownership of the parent directory
         let file = create_file(&temp_path)?;
@@ -64,24 +72,15 @@ impl SafeFileCreator {
     }
 
     /// Generates a temporary file path in the same directory as the destination file
-    fn temp_file_path(dest_path: Option<&Path>) -> io::Result<PathBuf> {
-        let (parent, file_name) = match dest_path {
-            Some(p) => {
-                let parent = p.parent().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "path doesn't have a valid parent directory")
-                })?;
-                let file_name = p.file_name().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "path doesn't have a valid file name")
-                })?;
-                (parent.to_owned(), file_name.to_str().unwrap_or_default())
-            },
-            None => (std::env::temp_dir(), ""),
-        };
-
+    fn temp_file_path(dest_dir: impl AsRef<Path>, file: Option<&str>) -> PathBuf {
         let mut rng = thread_rng();
         let random_hash: String = (0..10).map(|_| rng.sample(Alphanumeric)).map(char::from).collect();
-        let temp_file_name = format!(".{}.{hash}.tmp", file_name, hash = random_hash);
-        Ok(parent.join(temp_file_name))
+        let temp_file_name = if let Some(filename) = file {
+            format!(".{filename}.{random_hash}.tmp")
+        } else {
+            format!(".{random_hash}.tmp")
+        };
+        dest_dir.as_ref().join(temp_file_name)
     }
 
     pub fn set_dest_path<P: AsRef<Path>>(&mut self, dest_path: P) {
@@ -151,35 +150,6 @@ impl Drop for SafeFileCreator {
     }
 }
 
-/// Write all bytes
-pub fn write_all_safe(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if !path.as_os_str().is_empty() {
-        let dir = path.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, format!("Unable to find parent path from {path:?}"))
-        })?;
-
-        // Make sure dir exists.
-        if !dir.exists() {
-            fs::create_dir_all(dir)?;
-        }
-
-        let mut tempfile = create_temp_file(dir, "")?;
-        tempfile.write_all(bytes)?;
-        tempfile.persist(path).map_err(|e| e.error)?;
-    }
-
-    Ok(())
-}
-
-pub fn create_temp_file(dir: &Path, suffix: &str) -> io::Result<NamedTempFile> {
-    let tempfile = tempfile::Builder::new()
-        .prefix(&format!("{}.", std::process::id()))
-        .suffix(suffix)
-        .tempfile_in(dir)?;
-
-    Ok(tempfile)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs::{self, File};
@@ -214,7 +184,8 @@ mod tests {
 
     #[test]
     fn test_safe_file_creator_new_unnamed() {
-        let mut safe_file_creator = SafeFileCreator::new_unnamed().unwrap();
+        let _dir = tempdir().unwrap();
+        let mut safe_file_creator = SafeFileCreator::new_unnamed(_dir.path()).unwrap();
         writeln!(safe_file_creator, "Hello, world!").unwrap();
 
         // Test error checking
