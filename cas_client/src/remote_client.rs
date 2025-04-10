@@ -43,7 +43,10 @@ pub const CAS_ENDPOINT: &str = "http://localhost:8080";
 pub const PREFIX_DEFAULT: &str = "default";
 
 utils::configurable_constants! {
-   ref NUM_CONCURRENT_RANGE_GETS: usize = 16;
+    ref NUM_CONCURRENT_RANGE_GETS: usize = GlobalConfigMode::HighPerformanceOption {
+        standard: 16,
+        high_performance: 100,
+    };
 
 // Env (HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY) to switch to writing terms sequentially to disk.
 // Benchmarks have shown that on SSD machines, writing in parallel seems to far outperform
