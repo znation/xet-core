@@ -735,42 +735,35 @@ fn remove_file(path: impl AsRef<Path>) -> Result<(), ChunkCacheError> {
     Ok(())
 }
 
-/// removes a directory but disregards a "NotFound" error if the directory is already gone
-fn remove_dir(path: impl AsRef<Path>) -> Result<(), ChunkCacheError> {
+/// tries to removes a directory but disregards a "NotFound" error if the directory is already gone,
+/// and returns false when the directory still exists
+fn remove_dir(path: impl AsRef<Path>) -> Result<bool, ChunkCacheError> {
     if let Err(e) = std::fs::remove_dir(path) {
-        if e.kind() != ErrorKind::NotFound {
-            return Err(e.into());
+        if e.kind() == ErrorKind::NotFound {
+            return Ok(true);
         }
+        if e.kind() == ErrorKind::DirectoryNotEmpty {
+            return Ok(false);
+        }
+        return Err(e.into());
     }
-    Ok(())
+    Ok(true)
 }
 
 // assumes dir_path is a path to a key directory i.e. cache_root/<prefix_dir>/<key_dir>
 // assumes a misformatted path is an error
 // checks if the directory is empty and removes it if so, then checks if the prefix dir is empty and removes it if so
 fn check_remove_dir(dir_path: impl AsRef<Path>) -> Result<(), ChunkCacheError> {
-    let readdir = match read_dir(&dir_path)? {
-        Some(rd) => rd,
-        None => return Ok(()),
-    };
-    if readdir.peekable().peek().is_some() {
+
+    let cont = remove_dir(&dir_path)?;
+    if !cont {
         return Ok(());
     }
-    // directory empty, remove it
-    remove_dir(&dir_path)?;
 
     // try to check and remove the prefix dir
     let prefix_dir = dir_path.as_ref().parent().ok_or(ChunkCacheError::Infallible)?;
-
-    let prefix_readdir = match read_dir(prefix_dir)? {
-        Some(prd) => prd,
-        None => return Ok(()),
-    };
-    if prefix_readdir.peekable().peek().is_some() {
-        return Ok(());
-    }
-    // directory empty, remove it
-    remove_dir(prefix_dir)
+    let _ = remove_dir(prefix_dir)?;
+    Ok(())
 }
 
 /// tries to parse just a Key from a file name encoded by fn `key_dir`
