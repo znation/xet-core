@@ -12,7 +12,7 @@ use cas_types::{ChunkRange, Key};
 use error_printer::ErrorPrinter;
 use file_utils::SafeFileCreator;
 use merklehash::MerkleHash;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 #[cfg(feature = "analysis")]
 use utils::output_bytes;
 
@@ -344,10 +344,16 @@ impl DiskCache {
         {
             // write cache item file
             let path = self.item_path(key, &cache_item)?;
-            let mut fw = SafeFileCreator::new(path)?;
-            fw.write_all(&header_buf)?;
-            fw.write_all(data)?;
-            fw.close()?;
+            match SafeFileCreator::new(path) {
+                Ok(mut fw) => {
+                    fw.write_all(&header_buf)?;
+                    fw.write_all(data)?;
+                    fw.close()?;
+                },
+                Err(e) => {
+                    info!("failed to write to cache item {} with key {}, with error {}", cache_item, key, e);
+                },
+            }
         }
 
         // evict items after ensuring the file write but before committing to cache state
