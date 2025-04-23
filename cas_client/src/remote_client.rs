@@ -559,7 +559,9 @@ pub(crate) async fn get_one_term(
             prefix: PREFIX_DEFAULT.to_string(),
             hash: term.hash.into(),
         };
-        cache.put(&key, &fetch_term.range, &chunk_byte_indices, &data)?;
+        if let Err(e) = cache.put(&key, &fetch_term.range, &chunk_byte_indices, &data) {
+            error!("failed to put into cache: {}", e);
+        }
     }
 
     // if the requested range is smaller than the fetched range, trim it down to the right data
