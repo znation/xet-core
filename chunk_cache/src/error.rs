@@ -10,7 +10,7 @@ pub enum ChunkCacheError {
     #[error("General: {0}")]
     General(String),
     #[error("IO: {0}")]
-    IO(#[from] std::io::Error),
+    IO(std::io::Error),
     #[error("ParseError: {0}")]
     Parse(String),
     #[error("bad range")]

@@ -12,7 +12,7 @@ use cas_types::{ChunkRange, Key};
 use error_printer::ErrorPrinter;
 use file_utils::SafeFileCreator;
 use merklehash::MerkleHash;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 #[cfg(feature = "analysis")]
 use utils::output_bytes;
 
@@ -253,7 +253,9 @@ impl DiskCache {
                         self.remove_item(key, &cache_item)?;
                         continue;
                     },
-                    _ => return Err(e.into()),
+                    _ => {
+                        panic!();
+                    },
                 },
             };
 
@@ -261,7 +263,7 @@ impl DiskCache {
                 let checksum = crc32_from_reader(&mut file)?;
                 if checksum == cache_item.checksum {
                     cache_item.verify();
-                    file.rewind()?;
+                    file.rewind().unwrap();
                 } else {
                     warn!("computed checksum {checksum} mismatch on cache item {key}/{cache_item}");
                     self.remove_item(key, &cache_item)?;
@@ -327,7 +329,7 @@ impl DiskCache {
 
         let header = CacheFileHeader::new(chunk_byte_indices);
         let mut header_buf = Vec::with_capacity(header.header_len());
-        header.serialize(&mut header_buf)?;
+        header.serialize(&mut header_buf).unwrap();
         let checksum = {
             let mut hasher = crc32fast::Hasher::new();
             hasher.update(&header_buf);
@@ -344,10 +346,10 @@ impl DiskCache {
         {
             // write cache item file
             let path = self.item_path(key, &cache_item)?;
-            let mut fw = SafeFileCreator::new(path)?;
-            fw.write_all(&header_buf)?;
-            fw.write_all(data)?;
-            fw.close()?;
+            let mut fw = SafeFileCreator::new(path).unwrap();
+            fw.write_all(&header_buf).unwrap();
+            fw.write_all(data).unwrap();
+            fw.close().unwrap();
         }
 
         // evict items after ensuring the file write but before committing to cache state
@@ -431,13 +433,13 @@ impl DiskCache {
             self.remove_item(key, cache_item)?;
             return Ok(false);
         };
-        let md = file.metadata()?;
+        let md = file.metadata().unwrap();
         if md.len() != cache_item.len {
             self.remove_item(key, cache_item)?;
             return Ok(false);
         }
         let mut buf = Vec::with_capacity(md.len() as usize);
-        file.read_to_end(&mut buf)?;
+        file.read_to_end(&mut buf).unwrap();
         let checksum = crc32fast::hash(&buf);
         if checksum != cache_item.checksum {
             self.remove_item(key, cache_item)?;
@@ -569,7 +571,7 @@ fn crc32_from_reader(reader: &mut impl Read) -> Result<u32, ChunkCacheError> {
     let mut buf = [0u8; CRC_BUFFER_SIZE];
     let mut hasher = crc32fast::Hasher::new();
     loop {
-        let num_read = reader.read(&mut buf)?;
+        let num_read = reader.read(&mut buf).unwrap();
         if num_read == 0 {
             break;
         }
@@ -611,9 +613,9 @@ fn get_range_from_cache_file<R: Read + Seek>(
         .chunk_byte_indices
         .get((range.end - start) as usize)
         .ok_or(ChunkCacheError::BadRange)?;
-    file_contents.seek(SeekFrom::Start((*start_byte as usize + header.header_len()) as u64))?;
+    file_contents.seek(SeekFrom::Start((*start_byte as usize + header.header_len()) as u64)).unwrap();
     let mut buf = vec![0; (end_byte - start_byte) as usize];
-    file_contents.read_exact(&mut buf)?;
+    file_contents.read_exact(&mut buf).unwrap();
     Ok(buf)
 }
 
@@ -626,7 +628,7 @@ fn read_dir(path: impl AsRef<Path>) -> OptionResult<std::fs::ReadDir, ChunkCache
             if e.kind() == ErrorKind::NotFound {
                 Ok(None)
             } else {
-                Err(e.into())
+                panic!();
             }
         },
     }
@@ -644,7 +646,7 @@ fn is_ok_dir(dir_result: Result<DirEntry, io::Error>) -> OptionResult<DirEntry, 
             if e.kind() == ErrorKind::NotFound {
                 return Ok(None);
             }
-            return Err(e.into());
+            panic!();
         },
     };
     let md = match dirent.metadata() {
@@ -653,7 +655,7 @@ fn is_ok_dir(dir_result: Result<DirEntry, io::Error>) -> OptionResult<DirEntry, 
             if e.kind() == ErrorKind::NotFound {
                 return Ok(None);
             }
-            return Err(e.into());
+            panic!();
         },
     };
     if !md.is_dir() {
@@ -673,7 +675,7 @@ fn try_parse_cache_file(file_result: io::Result<DirEntry>, capacity: u64) -> Opt
             if e.kind() == ErrorKind::NotFound {
                 return Ok(None);
             }
-            return Err(e.into());
+            panic!();
         },
     };
     let md = match item.metadata() {
@@ -682,7 +684,7 @@ fn try_parse_cache_file(file_result: io::Result<DirEntry>, capacity: u64) -> Opt
             if e.kind() == ErrorKind::NotFound {
                 return Ok(None);
             }
-            return Err(e.into());
+            panic!();
         },
     };
 
@@ -729,7 +731,7 @@ fn try_parse_cache_file(file_result: io::Result<DirEntry>, capacity: u64) -> Opt
 fn remove_file(path: impl AsRef<Path>) -> Result<(), ChunkCacheError> {
     if let Err(e) = std::fs::remove_file(path) {
         if e.kind() != ErrorKind::NotFound {
-            return Err(e.into());
+            panic!();
         }
     }
     Ok(())
@@ -745,7 +747,7 @@ fn remove_dir(path: impl AsRef<Path>) -> Result<bool, ChunkCacheError> {
         if e.kind() == ErrorKind::DirectoryNotEmpty {
             return Ok(false);
         }
-        return Err(e.into());
+        panic!();
     }
     Ok(true)
 }

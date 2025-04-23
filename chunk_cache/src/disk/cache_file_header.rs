@@ -32,11 +32,11 @@ impl CacheFileHeader {
     }
 
     pub fn deserialize<R: Read + Seek>(reader: &mut R) -> Result<Self, ChunkCacheError> {
-        reader.seek(std::io::SeekFrom::Start(0))?;
-        let chunk_byte_indices_len = read_u32(reader)?;
+        reader.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let chunk_byte_indices_len = read_u32(reader).unwrap();
         let mut chunk_byte_indices: Vec<u32> = Vec::with_capacity(chunk_byte_indices_len as usize);
         for i in 0..chunk_byte_indices_len {
-            let idx = read_u32(reader)?;
+            let idx = read_u32(reader).unwrap();
             if i == 0 && idx != 0 {
                 return Err(ChunkCacheError::parse("first byte index isn't 0"));
             } else if !chunk_byte_indices.is_empty() && chunk_byte_indices.last().unwrap() >= &idx {

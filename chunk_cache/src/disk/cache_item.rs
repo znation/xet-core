@@ -133,10 +133,10 @@ impl CacheItem {
     pub(crate) fn file_name(&self) -> Result<String, ChunkCacheError> {
         let mut buf = [0u8; CACHE_ITEM_FILE_NAME_BUF_SIZE];
         let mut w = Cursor::new(&mut buf[..]);
-        write_u32(&mut w, self.range.start)?;
-        write_u32(&mut w, self.range.end)?;
-        write_u64(&mut w, self.len)?;
-        write_u32(&mut w, self.checksum)?;
+        write_u32(&mut w, self.range.start).unwrap();
+        write_u32(&mut w, self.range.end).unwrap();
+        write_u64(&mut w, self.len).unwrap();
+        write_u32(&mut w, self.checksum).unwrap();
         Ok(BASE64_ENGINE.encode(buf))
     }
 
@@ -146,10 +146,10 @@ impl CacheItem {
             return Err(ChunkCacheError::parse("decoded buf is not the right size for a cache item file name"));
         }
         let mut r = Cursor::new(buf);
-        let start = read_u32(&mut r)?;
-        let end = read_u32(&mut r)?;
-        let len = read_u64(&mut r)?;
-        let checksum = read_u32(&mut r)?;
+        let start = read_u32(&mut r).unwrap();
+        let end = read_u32(&mut r).unwrap();
+        let len = read_u64(&mut r).unwrap();
+        let checksum = read_u32(&mut r).unwrap();
         if start >= end {
             return Err(ChunkCacheError::BadRange);
         }
