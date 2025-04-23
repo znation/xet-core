@@ -560,7 +560,7 @@ pub(crate) async fn get_one_term(
             hash: term.hash.into(),
         };
         if let Err(e) = cache.put(&key, &fetch_term.range, &chunk_byte_indices, &data) {
-            error!("failed to put into cache: {}", e);
+            info!("failed to put into cache: {}", e);
         }
     }
 
